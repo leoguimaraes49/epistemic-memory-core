@@ -267,6 +267,9 @@ O diretório [`00_Manual/`](00_Manual/) contém a especificação formal que reg
 O guia usa **Windows com PowerShell** ou **Linux com Bash**. O macOS usa a mesma implementação POSIX, com validação nessa plataforma ainda pendente. O supervisor de reinício por PowerShell é específico do Windows. No Linux, o trabalhador pode ser iniciado com `./.venv/bin/python src/autonomia.py serve` quando habilitado na configuração.
 
 ### 1. Clonar e Instalar Dependências
+
+Use Python 3.11 ou 3.12. O arquivo de dependências seleciona a versão do NumPy compatível com seu Python.
+
 ```powershell
 git clone https://github.com/leoguimaraes49/epistemic-memory-core.git
 cd epistemic-memory-core
@@ -338,7 +341,7 @@ $env:CEREBRO_PESSOAL_ACESSO = "permitido"
 
 No Linux, execute `CEREBRO_PESSOAL_ACESSO=permitido ./.venv/bin/python src/cli.py autotestes`.
 
-O [GitHub Actions](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml) executa a bateria completa no Windows e no Ubuntu, com os dois arquivos vetoriais verificados por SHA-256 e dados de teste fictícios.
+O [GitHub Actions](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml) executa a bateria completa no Windows com Python 3.12 e no Ubuntu com Python 3.11 e 3.12. Os arquivos vetoriais são verificados por SHA-256 e os dados de teste são fictícios.
 
 Sem os recursos vetoriais e sem um caminho alternativo configurado, a suíte vetorial fica como `skipped` e o resultado geral fica `incomplete` se as demais passarem. Um caminho explícito inválido ou uma instalação parcial gera falha. As operações que exigem a bateria completa continuam condicionadas a um relatório `passed`.
 
