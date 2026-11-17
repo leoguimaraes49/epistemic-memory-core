@@ -6,15 +6,21 @@ Utiliza apenas a biblioteca padrão do Python (sem dependências externas).
 """
 import json
 import os
+import re
+import secrets
 import sys
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import ponte_pessoal as p
+
+MAX_POST_BYTES = 65536
+SESSION_TOKEN = secrets.token_hex(24)
+_ALLOWED_HOST_RE = re.compile(r'^(?:127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$', re.I)
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -336,9 +342,19 @@ HTML_PAGE = """<!DOCTYPE html>
             document.getElementById(tabId).classList.add('active');
         }
 
+        const EMC_CSRF_TOKEN = "__EMC_CSRF_TOKEN__";
+
         async function fetchAPI(endpoint, options = {}) {
             try {
-                const res = await fetch(endpoint, options);
+                const reqOptions = { ...options };
+                const method = (reqOptions.method || 'GET').toUpperCase();
+                if (method !== 'GET' && method !== 'HEAD') {
+                    reqOptions.headers = {
+                        ...(reqOptions.headers || {}),
+                        'X-EMC-Token': EMC_CSRF_TOKEN
+                    };
+                }
+                const res = await fetch(endpoint, reqOptions);
                 return await res.json();
             } catch (err) {
                 console.error("Erro na API:", err);
@@ -389,6 +405,9 @@ HTML_PAGE = """<!DOCTYPE html>
                 document.getElementById('records-count').textContent = fluxo.records ?? '--';
                 document.getElementById('flow-status').textContent = fluxo.issues && fluxo.issues.length ? 
                     fluxo.issues.length + ' problemas de referências' : 'Sem problemas de referências encontrados';
+            } else if (fluxo.reason) {
+                document.getElementById('records-count').textContent = '--';
+                document.getElementById('flow-status').textContent = fluxo.reason;
             }
 
             // Demandas
@@ -398,6 +417,12 @@ HTML_PAGE = """<!DOCTYPE html>
 
         async function loadDemandas() {
             const data = await fetchAPI('/api/demandas');
+            if (data && data.status === 'denied') {
+                document.getElementById('demands-count').textContent = '--';
+                document.getElementById('demands-waiting').textContent = 'Acesso bloqueado';
+                document.getElementById('demands-table-container').textContent = data.reason || 'Acesso desabilitado.';
+                return;
+            }
             if (data && data.demands) {
                 document.getElementById('demands-count').textContent = data.demands.length;
                 const waiting = data.demands.filter(d => d.operational_status === 'waiting_user' || d.operational_status === 'expired_needs_review').length;
@@ -420,6 +445,10 @@ HTML_PAGE = """<!DOCTYPE html>
 
         async function loadFontes() {
             const data = await fetchAPI('/api/fontes');
+            if (data && data.status === 'denied') {
+                document.getElementById('sources-table-container').textContent = data.reason || 'Acesso desabilitado.';
+                return;
+            }
             if (data && data.records) {
                 let html = '<table><thead><tr><th>ID</th><th>Título</th><th>Revisão</th></tr></thead><tbody>';
                 data.records.slice(0, 15).forEach(f => {
@@ -506,14 +535,81 @@ def dashboard_diagnostic():
             'embeddings_enabled': bool(execution.get('enabled') and execution.get('embeddings_enabled'))}
 
 
+def _is_allowed_host(host_header):
+    if not isinstance(host_header, str):
+        return False
+    match = _ALLOWED_HOST_RE.fullmatch(host_header.strip())
+    if not match:
+        return False
+    port_str = match.group(1)
+    return port_str is None or 1 <= int(port_str) <= 65535
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
+    csrf_token = SESSION_TOKEN
+
+    def _check_host(self):
+        if not _is_allowed_host(self.headers.get('Host', '')):
+            self.send_json({'status': 'denied', 'reason': 'Host HTTP não autorizado'}, code=403)
+            return False
+        return True
+
+    def _check_csrf(self):
+        sec_site = (self.headers.get('Sec-Fetch-Site') or '').strip().lower()
+        if sec_site and sec_site not in ('same-origin', 'none'):
+            self.send_json({'status': 'denied', 'reason': 'Requisição cross-site bloqueada'}, code=403)
+            return False
+        origin = (self.headers.get('Origin') or '').strip()
+        if origin:
+            parsed = urllib.parse.urlparse(origin)
+            if parsed.scheme not in ('http', 'https') or (parsed.hostname or '').lower() not in ('127.0.0.1', 'localhost', '::1'):
+                self.send_json({'status': 'denied', 'reason': 'Origem HTTP não autorizada'}, code=403)
+                return False
+        supplied = self.headers.get('X-EMC-Token') or ''
+        if not supplied or not secrets.compare_digest(supplied, self.csrf_token):
+            self.send_json({'status': 'denied', 'reason': 'Token de sessão ausente ou inválido'}, code=403)
+            return False
+        return True
+
+    def _read_json_body(self):
+        raw_len = self.headers.get('Content-Length', '0')
+        try:
+            length = int(raw_len)
+        except (TypeError, ValueError):
+            self.send_json({'status': 'invalid', 'reason': 'Content-Length inválido'}, code=400)
+            return None
+        if length < 0:
+            self.send_json({'status': 'invalid', 'reason': 'Content-Length negativo'}, code=400)
+            return None
+        if length > MAX_POST_BYTES:
+            self.send_json({'status': 'invalid', 'reason': 'Corpo excede limite de 64 KB'}, code=413)
+            return None
+        if length == 0:
+            return {}
+        try:
+            payload = json.loads(self.rfile.read(length).decode('utf-8'))
+        except (UnicodeDecodeError, ValueError):
+            self.send_json({'status': 'invalid', 'reason': 'Corpo JSON inválido'}, code=400)
+            return None
+        if not isinstance(payload, dict):
+            self.send_json({'status': 'invalid', 'reason': 'Objeto JSON esperado'}, code=400)
+            return None
+        return payload
+
     def do_GET(self):
+        if not self._check_host():
+            return
         url = urllib.parse.urlparse(self.path)
         if url.path in ('/', '/index.html'):
+            rendered = HTML_PAGE.replace('__EMC_CSRF_TOKEN__', self.csrf_token).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'")
             self.end_headers()
-            self.wfile.write(HTML_PAGE.encode('utf-8'))
+            self.wfile.write(rendered)
         elif url.path == '/api/estado':
             self.send_json(p.estado())
         elif url.path == '/api/diagnostico':
@@ -527,17 +623,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif url.path == '/api/fontes':
             self.send_json(p.listar_fontes())
         else:
-            self.send_error(404, "Não encontrado")
+            self.send_json({'status': 'not_found', 'reason': 'Não encontrado'}, code=404)
 
     def do_POST(self):
+        if not self._check_host() or not self._check_csrf():
+            return
+        data = self._read_json_body()
+        if data is None:
+            return
         url = urllib.parse.urlparse(self.path)
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
-        try:
-            data = json.loads(body)
-        except Exception:
-            data = {}
-
         if url.path == '/api/buscar':
             query = data.get('consulta', '')
             limite = data.get('limite', 10)
@@ -549,29 +643,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif url.path == '/api/autotestes':
             self.send_json(p.executar_autotestes())
         else:
-            self.send_error(404, "Endpoint não encontrado")
+            self.send_json({'status': 'not_found', 'reason': 'Endpoint não encontrado'}, code=404)
 
-    def send_json(self, data):
-        self.send_response(200)
+    def send_json(self, data, code=200):
+        payload_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
+        if code >= 400:
+            self.close_connection = True
+        self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(payload_bytes)))
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Cache-Control', 'no-store')
         self.end_headers()
-        self.wfile.write(json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8'))
+        self.wfile.write(payload_bytes)
+        self.wfile.flush()
 
     def log_message(self, format, *args):
         # Silencia logs de polling do dashboard no terminal
         return
 
-def run_dashboard(port=8080):
-    server_address = ('127.0.0.1', port)
-    try:
-        httpd = HTTPServer(server_address, DashboardHandler)
-        print(f"Epistemic Memory Core dashboard: http://127.0.0.1:{port}")
-        print("Pressione Ctrl+C para encerrar.")
-        httpd.serve_forever()
-    except OSError:
-        # Se a porta estiver em uso, tenta a próxima
-        run_dashboard(port + 1)
+def run_dashboard(port=8080, max_tries=20):
+    last_error = None
+    for candidate_port in range(port, min(65536, port + max(1, max_tries))):
+        server_address = ('127.0.0.1', candidate_port)
+        try:
+            httpd = ThreadingHTTPServer(server_address, DashboardHandler)
+        except OSError as exc:
+            last_error = exc
+            continue
+        try:
+            print(f"Epistemic Memory Core dashboard: http://127.0.0.1:{candidate_port}")
+            print("Pressione Ctrl+C para encerrar.")
+            httpd.serve_forever()
+            return
+        finally:
+            httpd.server_close()
+    raise OSError(f"Nenhuma porta local disponível a partir de {port}") from last_error
 
-if __name__ == '__main__':
+
+def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 8080
     run_dashboard(port)
+
+
+if __name__ == '__main__':
+    main()

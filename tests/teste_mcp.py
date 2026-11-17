@@ -14,7 +14,7 @@ async def main():
     async with stdio_client(real) as (r,w):
         async with ClientSession(r,w) as s:
             info=await s.initialize(); assert 'manual' in (info.instructions or '').lower(); names={x.name for x in (await s.list_tools()).tools}
-            assert names=={'estado','ler_manual','listar_fontes','ler_fonte','registrar_fonte','retificar_fonte','consultar_operacao','excluir_fonte','registrar_conhecimento','ler_conhecimento','buscar_contexto','verificar_fluxo','executar_autotestes','processar_contribuicao','estado_executor','enfileirar_manutencao','consultar_execucao','cancelar_execucao','preparar_decisao','registrar_revisao','adotar_melhoria','cancelar_demanda','concluir_avaliacao','consultar_demanda','estado_execucao','iniciar_demanda','listar_demandas','pontuar_avaliacao','registrar_documento','responder_pendencia','reverter_melhoria'}
+            assert names=={'estado','ler_manual','avaliar_resposta','consultar_comprovante','listar_fontes','ler_fonte','registrar_fonte','retificar_fonte','consultar_operacao','excluir_fonte','registrar_conhecimento','ler_conhecimento','buscar_contexto','verificar_fluxo','executar_autotestes','processar_contribuicao','estado_executor','enfileirar_manutencao','consultar_execucao','cancelar_execucao','preparar_decisao','registrar_revisao','adotar_melhoria','cancelar_demanda','concluir_avaliacao','consultar_demanda','estado_execucao','iniciar_demanda','listar_demandas','pontuar_avaliacao','registrar_documento','responder_pendencia','reverter_melhoria'}
             assert (await call(s,'estado',{}))['content_access']=='disabled'
             assert (await call(s,'ler_manual',{'nome':'indice-manual-cerebro.md'}))['status']=='ok'
             assert (await call(s,'ler_manual',{'nome':'../Comece aqui.md'}))['status']=='denied'
@@ -62,5 +62,4 @@ async def main():
                 assert (await call(s,'registrar_fonte',request))['status']=='invalid'
                 assert len((await call(s,'listar_fontes',{}))['records'])==0
         print('Cliente MCP: fixture criada, lida, retificada, conflito rejeitado, retentativa após reinício e exclusão controlada: OK')
-    print('Cofre pessoal: registros controlados',len(Store().list()))
 if __name__=='__main__':asyncio.run(main())

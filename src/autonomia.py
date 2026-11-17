@@ -29,7 +29,10 @@ CODE_FILES = (
     'tests/testes_provedores.py', 'tests/testes_mcp04.py', 'tests/apoio_testes04.py',
     'tests/testes_mcp_vetores.py', 'tests/testes_evidencias.py', 'tests/testes_persistencia05.py',
     'tests/testes_mcp05.py', 'tests/testes_recuperacao_fila.py', 'tests/testes_melhorias_seguranca.py',
-    'tests/testes_operacao_melhorias.py', 'tests/testes_atribuicao.py', 'tests/testes_continuacoes07.py'
+    'tests/testes_operacao_melhorias.py', 'tests/testes_atribuicao.py', 'tests/testes_continuacoes07.py',
+    'tests/testes_dashboard.py', 'tests/testes_auditoria_escala.py', 'tests/testes_dossie_studio.py',
+    'apps/dossie_studio/__init__.py', 'apps/dossie_studio/engine_adapter.py',
+    'apps/dossie_studio/scenarios.py', 'apps/dossie_studio/web.py', 'apps/dossie_studio/cli.py'
 )
 DEFAULTS = {'enabled':False,'content_access':'bloqueado','interval_seconds':60,
             'max_jobs_per_hour':12,'max_pending_jobs':100,'max_attempts':3,'job_timeout_seconds':120,
@@ -531,6 +534,16 @@ def worker_health(path,now=None):
                 if kernel.GetExitCodeProcess(handle,ctypes.byref(code)):alive=code.value==259
             finally:kernel.CloseHandle(handle)
         elif ctypes.get_last_error() in (87,1168):alive=False
+    elif os.name!='nt' and type(pid)is int and pid>0:
+        try:
+            os.kill(pid,0)
+            alive=True
+        except ProcessLookupError:
+            alive=False
+        except PermissionError:
+            alive=True
+        except OSError:
+            alive=None
     reported=record.get('status','unknown')
     health=('stopped' if reported=='stopped' else 'not_running' if alive is False else
             'stale' if age is None or age>30 or age < -5 else reported)

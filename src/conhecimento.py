@@ -9,7 +9,7 @@ import sqlite3
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 # Este alias adquire conteúdo; mutexes continuam usando nucleo.exclusive, imediato.
 from nucleo import Store, Invalid, Conflict, Uncertain, NOW, sha, canon, render, acquire_content as exclusive, verify_posix_file
 import esquemas
@@ -95,9 +95,21 @@ class Knowledge:
     def catalog(self, recovering=None):
         records, paths, issues = {}, {}, []
         # Fontes são lidas pela autoridade já existente: hash, revisão e tombstone.
-        for item in self.sources.list():
-            record = self.sources.read(item['id'])
-            records[record['id']] = record
+        sources_loader = getattr(self.sources, 'read_all', None)
+        if sources_loader is not None:
+            for record in sources_loader():
+                records[record['id']] = record
+        else:
+            for item in self.sources.list():
+                record = self.sources.read(item['id'])
+                records[record['id']] = record
+        with self.connect() as c:
+            managed_map = dict(c.execute('SELECT id, digest FROM managed').fetchall())
+            proposed_rows = c.execute("SELECT path, data FROM operations WHERE status='proposed'").fetchall()
+        proposed_by_path = {}
+        for op_path, op_data in proposed_rows:
+            if isinstance(op_path, str):
+                proposed_by_path.setdefault(op_path.replace('\\', '/'), []).append(op_data)
         for kind, folder in FOLDERS.items():
             directory = self.vault / folder
             if directory.is_symlink() or not directory.resolve().is_relative_to(self.vault):
@@ -113,17 +125,15 @@ class Knowledge:
                 ident = record.get('id')
                 if ident in records:
                     raise Conflict('identidade duplicada no cofre')
-                with self.connect() as c:
-                    known = c.execute('SELECT digest FROM managed WHERE id=?', (ident,)).fetchone()
-                    pending_new = c.execute("SELECT 1 FROM operations WHERE status='proposed' AND path=?",(str(path.relative_to(self.vault)),)).fetchone()
-                if not known and pending_new and recovering != ident:
+                rel_path = path.relative_to(self.vault).as_posix()
+                known_digest = managed_map.get(ident)
+                pending_list = proposed_by_path.get(rel_path)
+                if known_digest is None and pending_list and recovering != ident:
                     raise Conflict('criação de conhecimento ainda não confirmada; reconciliar antes de usar')
-                if known and known[0] != sha(data):
+                if known_digest is not None and known_digest != sha(data):
                     if recovering != ident:
                         raise Conflict('edição externa ou efeito pendente; reconciliar antes de usar')
-                    with self.connect() as c:
-                        pending=c.execute("SELECT data FROM operations WHERE status='proposed' AND path=?",(str(path.relative_to(self.vault)),)).fetchall()
-                    if not any(row[0] == data for row in pending):
+                    if not pending_list or not any(op_data == data for op_data in pending_list):
                         raise Conflict('edição externa de conhecimento')
                 records[ident] = record; paths[ident] = path
         return records, paths, issues
@@ -364,15 +374,15 @@ class Knowledge:
                     ident = str(uuid.uuid4())
                     from nucleo import filename
                     directory = self.vault / FOLDERS[kind]; directory.mkdir(parents=True,exist_ok=True)
-                    reserved=[Path(row[0]).name for row in c.execute("SELECT path FROM operations WHERE status!='confirmed'").fetchall()
-                              if Path(row[0]).parent==Path(FOLDERS[kind])]
+                    reserved=[PurePosixPath(row[0].replace('\\', '/')).name for row in c.execute("SELECT path FROM operations WHERE status!='confirmed'").fetchall()
+                              if row[0] and PurePosixPath(row[0].replace('\\', '/')).parent.as_posix()==FOLDERS[kind]]
                     path = directory / filename(title, ident, [f.name for f in directory.iterdir()]+reserved)
                     record = {'id':ident,'record_type':kind,'schema_version':'0.1','revision':1,'title':title,'created_at':now,'updated_at':now,'created_by':'extensao_conhecimento','access_policy_ref':'proprietario_local','lifecycle_status':'active','payload_format':'brain_json_v1'}
                 self._reserve_business(c,kind,payload,ident)
                 record['title'] = title; record['payload'] = payload
                 data = self._render(record, records, paths)
                 result = {'status':'confirmed','id':ident,'revision':record['revision']}
-                c.execute('INSERT INTO operations VALUES(?,?,?,?,?,?)', (key,fingerprint,'proposed',str(path.relative_to(self.vault)),data,json.dumps(result)))
+                c.execute('INSERT INTO operations VALUES(?,?,?,?,?,?)', (key,fingerprint,'proposed',path.relative_to(self.vault).as_posix(),data,json.dumps(result)))
             if not prepared:
                 c.execute('INSERT INTO prepared_requests VALUES(?,?,?,?)',(key,fingerprint,serialized,int(review_authorized)))
         # Um pedido proposto pode ser retomado, mas efeitos parciais nunca são sucesso.
@@ -398,7 +408,7 @@ class Knowledge:
                     stream.seek(0); stream.write(data); stream.truncate(); stream.flush(); os.fsync(fd)
                 if os.name != 'nt':
                     verify_posix_file(path, fd, data)
-            c.execute('INSERT OR REPLACE INTO managed VALUES(?,?,?,?)',(result['id'],str(path.relative_to(self.vault)),sha(data),result['revision']))
+            c.execute('INSERT OR REPLACE INTO managed VALUES(?,?,?,?)',(result['id'],path.relative_to(self.vault).as_posix(),sha(data),result['revision']))
             c.execute("UPDATE operations SET status='confirmed',data=NULL WHERE key=?",(key,))
             c.execute('UPDATE prepared_requests SET request=NULL WHERE key=?',(key,))
         return result

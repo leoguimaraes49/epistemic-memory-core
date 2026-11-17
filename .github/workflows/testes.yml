@@ -18,6 +18,8 @@ jobs:
             python: "3.11"
           - os: ubuntu-24.04
             python: "3.12"
+          - os: macos-15
+            python: "3.12"
           - os: windows-2022
             python: "3.12"
     name: ${{ matrix.os }} · Python ${{ matrix.python }}
@@ -38,19 +40,36 @@ jobs:
           cache-dependency-path: requirements-execucao04.txt
       - name: Instalar dependências
         run: python -m pip install -r requirements-execucao04.txt
-      - name: Preparar os recursos vetoriais
+      - name: Cache dos recursos vetoriais E5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: modelos/e5-multilingual-small
+          key: e5-multilingual-small-ca456c06-0b44a9d7
+      - name: Preparar e verificar os recursos vetoriais
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p modelos/e5-multilingual-small
-          cd modelos/e5-multilingual-small
           base="https://huggingface.co/intfloat/multilingual-e5-small/resolve/614241f622f53c4eeff9890bdc4f31cfecc418b3"
-          curl --fail --location --retry 3 --max-time 300 --output model.onnx "$base/onnx/model.onnx"
-          curl --fail --location --retry 3 --max-time 120 --output tokenizer.json "$base/tokenizer.json"
-          sha256sum --check <<'CHECKSUMS'
-          ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665  model.onnx
-          0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39  tokenizer.json
-          CHECKSUMS
+          if [ ! -f modelos/e5-multilingual-small/model.onnx ]; then
+            curl --fail --location --retry 3 --max-time 300 --output modelos/e5-multilingual-small/model.onnx "$base/onnx/model.onnx"
+          fi
+          if [ ! -f modelos/e5-multilingual-small/tokenizer.json ]; then
+            curl --fail --location --retry 3 --max-time 120 --output modelos/e5-multilingual-small/tokenizer.json "$base/tokenizer.json"
+          fi
+          python - <<'PY'
+          import hashlib, pathlib
+          folder = pathlib.Path("modelos/e5-multilingual-small")
+          expected = {
+              "model.onnx": "ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665",
+              "tokenizer.json": "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+          }
+          for name, digest in expected.items():
+              actual = hashlib.sha256((folder / name).read_bytes()).hexdigest()
+              if actual != digest:
+                  raise SystemExit(f"SHA-256 divergente em {name}: {actual}")
+          print("Recursos vetoriais verificados por SHA-256.")
+          PY
       - name: Executar as suítes oficiais
         shell: bash
         run: |

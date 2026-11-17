@@ -95,8 +95,15 @@ def _validated_config(raw):
     return cfg
 
 
+def _config_path(sources):
+    direct=_safe_path(sources,'execucao.json')
+    if direct.exists():return direct
+    nested=_safe_path(sources,'config','execucao.json')
+    return nested if nested.exists() else direct
+
+
 def _read_config(sources,allow_missing=False):
-    path=_safe_path(sources,'execucao.json')
+    path=_config_path(sources)
     raw={} if allow_missing and not path.exists() else _read_json(path)
     _validated_config(raw)
     return raw
@@ -254,7 +261,7 @@ def _advance(path,state,phase):
 def _write_config(sources,expected,following):
     _validated_config(following)
     if canon(_read_config(sources))!=canon(expected):raise Conflict('configuração concorrente não foi sobrescrita')
-    atomic_json(_safe_path(sources,'execucao.json'),following)
+    atomic_json(_config_path(sources),following)
     if canon(_read_config(sources))!=canon(following):raise Conflict('configuração mudou durante a escrita')
 
 

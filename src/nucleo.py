@@ -120,7 +120,7 @@ def parse(b):
 def filename(title,ident,existing):
     t=re.sub(r'[<>:"/\\|?*\x00-\x1f]',' ',title).strip(' .')
     t=re.sub(r'\s+',' ',t)[:90].rstrip(' .')
-    if not t or t.upper() in {'CON','PRN','AUX','NUL','COM1','LPT1'}: t='Fonte'
+    if not t or re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[1-9\xb9\xb2\xb3]|LPT[1-9\xb9\xb2\xb3])',t,re.I): t='Fonte'
     name=t+'.md'
     if name.casefold() in {x.casefold() for x in existing}: name=f'{t} — {ident[:8]}.md'
     return name
@@ -161,9 +161,19 @@ class Store:
         n=parse(b)
         if n['id']!=ident or n['revision']!=r[1]:raise Conflict('identidade ou revisão divergente')
         return n
+    def read_all(self):
+        with self.connect() as c:
+            rows=c.execute('SELECT id,filename,revision,digest FROM records WHERE id NOT IN (SELECT record_id FROM tombstones) ORDER BY filename').fetchall()
+        result=[]
+        for ident,fname,rev,digest in rows:
+            b=read_exclusive(self.safe_path(fname))
+            if sha(b)!=digest:raise Conflict('edição externa detectada; reconciliação necessária')
+            n=parse(b)
+            if n['id']!=ident or n['revision']!=rev:raise Conflict('identidade ou revisão divergente')
+            result.append(n)
+        return result
     def list(self):
-        with self.connect() as c:ids=[r[0] for r in c.execute('SELECT id FROM records WHERE id NOT IN (SELECT record_id FROM tombstones) ORDER BY filename').fetchall()]
-        return [{'id':n['id'],'title':n['title'],'revision':n['revision']} for n in (self.read(i) for i in ids)]
+        return [{'id':n['id'],'title':n['title'],'revision':n['revision']} for n in self.read_all()]
     def _validate_parent(self,c,ref,ident):
         if ref['record_id']==ident:raise Invalid('fonte não pode ser sua própria origem')
         if c.execute('SELECT 1 FROM tombstones WHERE record_id=?',(ref['record_id'],)).fetchone():

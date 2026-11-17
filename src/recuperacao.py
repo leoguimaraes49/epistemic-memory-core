@@ -1,9 +1,58 @@
 """Busca lexical, semântica local e grafo; cache vinculado à geração observada."""
-import hashlib,json,sqlite3
+import array,hashlib,json,sqlite3,sys
 from pathlib import Path
 from contextlib import contextmanager
 from nucleo import Invalid,Conflict,canon,sha,NOW
 from conhecimento import Knowledge,refs
+
+
+def _pack_vector(vector):
+    arr=array.array('d',(float(x) for x in vector))
+    if sys.byteorder!='little':arr.byteswap()
+    return arr.tobytes()
+
+
+def _unpack_vector(raw):
+    if isinstance(raw,(bytes,bytearray,memoryview)):
+        arr=array.array('d')
+        arr.frombytes(bytes(raw))
+        if sys.byteorder!='little':arr.byteswap()
+        return arr
+    return json.loads(raw)
+
+
+def _score_vectors(eligible_rows,queries):
+    if not eligible_rows or not queries:return {}
+    np=sys.modules.get('numpy')
+    if np is not None:
+        try:
+            q_mat=np.asarray(queries,dtype=np.float64)
+            if q_mat.ndim==2 and q_mat.shape[1]>0:
+                dim=q_mat.shape[1]
+                fast_ids=[];fast_vecs=[];fallback=[]
+                for ident,raw in eligible_rows:
+                    if isinstance(raw,(bytes,bytearray,memoryview)) and len(raw)==dim*8:
+                        fast_ids.append(ident);fast_vecs.append(np.frombuffer(raw,dtype='<f8'))
+                    else:
+                        fallback.append((ident,_unpack_vector(raw)))
+                scores={}
+                if fast_vecs:
+                    mat=np.vstack(fast_vecs)
+                    max_per_row=(mat @ q_mat.T).max(axis=1)
+                    for ident,val in zip(fast_ids,max_per_row.tolist()):
+                        scores[ident]=max(scores.get(ident,float('-inf')),float(val))
+                for ident,vec in fallback:
+                    val=max(sum(a*b for a,b in zip(vec,q)) for q in queries)
+                    scores[ident]=max(scores.get(ident,float('-inf')),val)
+                return scores
+        except (TypeError,ValueError):
+            pass
+    scores={}
+    for ident,raw in eligible_rows:
+        vector=_unpack_vector(raw)
+        score=max(sum(a*b for a,b in zip(vector,q)) for q in queries)
+        scores[ident]=max(scores.get(ident,float('-inf')),score)
+    return scores
 
 
 class LocalEmbeddings:
@@ -72,21 +121,23 @@ class Retrieval:
             for ident,record in eligible.items():
                 text=record['title']+'\n'+canon(record['payload']);digest=sha(text.encode())
                 if existing.get(ident)!=digest:updates[ident]=(digest,self.embedder.chunks(text))
-            if self.snapshot()[0]!=generation:raise Conflict('base mudou durante atualização do índice')
-            with self.connect() as c:
-                c.execute('BEGIN IMMEDIATE')
-                for ident in set(existing)-set(eligible):c.execute('DELETE FROM vectors WHERE id=?',(ident,))
-                for ident,(digest,vectors) in updates.items():
-                    c.execute('DELETE FROM vectors WHERE id=?',(ident,))
-                    for part,vector in enumerate(vectors):c.execute('INSERT INTO vectors VALUES(?,?,?,?)',(ident,part,digest,canon(vector)))
-                c.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('generation',generation))
-                vectors=list(c.execute('SELECT id,value FROM vectors'))
-            queries=self.embedder.chunks(query,'query');scores={}
-            for ident,raw in vectors:
-                if ident not in eligible:continue
-                vector=json.loads(raw)
-                score=max(sum(a*b for a,b in zip(vector,q)) for q in queries)
-                scores[ident]=max(scores.get(ident,float('-inf')),score)
+            stale_ids=set(existing)-set(eligible)
+            if updates or stale_ids:
+                if self.snapshot()[0]!=generation:raise Conflict('base mudou durante atualização do índice')
+                with self.connect() as c:
+                    c.execute('BEGIN IMMEDIATE')
+                    for ident in stale_ids:c.execute('DELETE FROM vectors WHERE id=?',(ident,))
+                    for ident,(digest,vectors_list) in updates.items():
+                        c.execute('DELETE FROM vectors WHERE id=?',(ident,))
+                        for part,vector in enumerate(vectors_list):c.execute('INSERT INTO vectors VALUES(?,?,?,?)',(ident,part,digest,_pack_vector(vector)))
+                    c.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('generation',generation))
+                    vectors=list(c.execute('SELECT id,value FROM vectors'))
+            else:
+                with self.connect() as c:
+                    vectors=list(c.execute('SELECT id,value FROM vectors'))
+            queries=self.embedder.chunks(query,'query')
+            eligible_rows=[(ident,raw) for ident,raw in vectors if ident in eligible]
+            scores=_score_vectors(eligible_rows,queries)
             semantic=sorted(scores,key=lambda i:(-scores[i],i))[:limit]
         ranks={}
         for channel in (exact,semantic):

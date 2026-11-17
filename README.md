@@ -2,12 +2,12 @@
 
 > **Motor de memória auditável, governança epistemológica e busca híbrida local para assistentes de IA, integrado ao Obsidian via Model Context Protocol (MCP) e expansível para arquiteturas multi-agente.**
 
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![Python 3.11 | 3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![Protocol](https://img.shields.io/badge/protocol-MCP%201.26-purple.svg)](https://modelcontextprotocol.io/)
 [![Embeddings](https://img.shields.io/badge/embeddings-E5--multilingual%20(ONNX%20Local)-green.svg)](https://github.com/microsoft/onnxruntime)
 [![Storage](https://img.shields.io/badge/storage-SQLite%20%2B%20Markdown-orange.svg)](https://obsidian.md/)
-[![Testes](https://img.shields.io/badge/testes-20%20su%C3%ADtes-blue.svg)](#-suíte-de-testes-automatizados)
-[![Version](https://img.shields.io/badge/version-v0.5%20%2B%20Patch%2007-blueviolet.svg)]()
+[![Testes](https://img.shields.io/badge/testes-22%20su%C3%ADtes-blue.svg)](#-suíte-de-testes-automatizados)
+[![Version](https://img.shields.io/badge/version-v0.5.7-blueviolet.svg)]()
 
 ---
 
@@ -193,15 +193,35 @@ python src/dashboard.py
 
 ---
 
+## 🏛️ Aplicativo Prático Incluso: Epistemic Dossier Studio (`apps/dossie_studio/`)
+
+Além do motor MCP e do painel operacional, o repositório inclui uma aplicação completa de auditoria construída 100% sobre os contratos canônicos do motor: o **[Epistemic Dossier Studio](apps/dossie_studio/README.md)**.
+
+Voltado para **auditoria de decisões de engenharia, revisões contratuais (MSA/aditivos) e protocolos experimentais**, o estúdio oferece:
+- **3 cenários práticos prontos em 1 clique:** *Engenharia & Cloud (Cotação GPU)*, *Jurídico & Compliance (Contrato MSA & Aditivos)* e *Pesquisa & Produtividade (Protocolo IFO-2 com item reverso)*.
+- **Simulador de Raio de Impacto (*Stale-on-Write*):** retifique uma cotação ou cláusula contratual e visualize o *diff* histórico preservado junto à suspensão automática em cascata de pareceres, escores e comprovantes dependentes.
+- **Verificador Determinístico de Comprovantes (`lab-assurance-2`):** valide somas (`sum`), campos JSON (`field`) e cadeias de dependência (`chain`) sem chamadas a LLMs.
+- **Teste interativo do Firewall de Atribuição:** demonstre ao vivo o bloqueio determinístico de falsas atribuições entre interlocutores.
+
+```powershell
+# Iniciar o Epistemic Dossier Studio (Web + CLI em workspace isolado)
+.\.venv\Scripts\python.exe apps/dossie_studio/cli.py --workspace ./meu-dossie serve --preload engenharia_cotacao
+# Abra http://127.0.0.1:8090
+```
+
+---
+
 ## 📂 Estrutura do Repositório
 
 ```text
 ├── 00_Manual/                   # Especificação formal completa (17 capítulos normativos)
+├── apps/dossie_studio/          # Aplicação prática Web + CLI de auditoria de decisões e contratos
 ├── config/                      # Configurações e manifestos (autonomia.json, execucao.json, manual_manifest.json)
 ├── docs/                        # Diagramas de arquitetura e guias operacionais
 │   ├── arquitetura.jpg
 │   └── guias/
-├── scripts/                     # Utilitários de inicialização e execução em segundo plano
+├── scripts/                     # Utilitários de inicialização, benchmark de carga e execução
+│   ├── benchmark_escala.py      # Benchmark multiprocesso, recuperação pós-falha e escala com ONNX E5
 │   ├── iniciar-template.py      # Assistente de inicialização de cofre limpo para novos usuários
 │   └── iniciar-trabalhador.ps1  # Inicializador do worker em segundo plano (Windows)
 ├── src/                         # Código-fonte do motor epistêmico (24 módulos Python)
@@ -228,7 +248,7 @@ python src/dashboard.py
 │   ├── provedores.py            # Chamada segura a modelos textuais com subprocesso isolado
 │   ├── melhorias.py             # Módulo de avaliação e adoção atômica de melhorias de código
 │   └── revisoes.py              # Controle de revisões e histórico de auditoria
-├── tests/                       # 20 suítes ativas (autoteste) + 2 scripts MCP históricos + apoio_testes04.py
+├── tests/                       # 22 suítes ativas (autoteste) + 2 scripts MCP de regressão + apoio_testes04.py
 ├── LICENSE                      # Licença personalizada: Uso Pessoal / Não Comercial Exclusiva do Autor
 ├── pyproject.toml               # Metadados do pacote e configuração de testes
 └── requirements-execucao04.txt  # Dependências Python
@@ -264,7 +284,7 @@ O diretório [`00_Manual/`](00_Manual/) contém a especificação formal que reg
 
 ## 🚀 Como Começar do Zero (Template Limpo)
 
-O guia usa **Windows com PowerShell** ou **Linux com Bash**. O macOS usa a mesma implementação POSIX, com validação nessa plataforma ainda pendente. O supervisor de reinício por PowerShell é específico do Windows. No Linux, o trabalhador pode ser iniciado com `./.venv/bin/python src/autonomia.py serve` quando habilitado na configuração.
+O guia usa **Windows com PowerShell** ou **Linux/macOS com Bash**. O supervisor de reinício por Tarefa Agendada via script PowerShell (`scripts/iniciar-trabalhador.ps1`) é específico do Windows; em sistemas POSIX (Linux e macOS), `src/supervisor.py` também inventaria processos via `ps` e o trabalhador pode ser iniciado com `./.venv/bin/python src/autonomia.py serve` quando habilitado na configuração.
 
 ### 1. Clonar e Instalar Dependências
 
@@ -331,22 +351,27 @@ O motor confere os SHA-256 dos dois arquivos antes de carregá-los. Para habilit
 
 ## 🧪 Suíte de Testes Automatizados
 
-O repositório contém **20 suítes automatizadas** em [`tests/`](tests/), com casos unitários e verificações MCP de ponta a ponta usando dados fictícios em diretórios temporários. Para rodar a bateria completa, instale primeiro os dois arquivos da busca vetorial.
+O repositório contém **22 suítes automatizadas** em [`tests/`](tests/), com casos unitários, testes de carga/escala, segurança HTTP e verificações MCP de ponta a ponta usando dados fictícios em diretórios temporários. Para rodar a bateria completa, instale primeiro os dois arquivos da busca vetorial.
 
 ```powershell
-# Executar a bateria completa das 20 suítes com validação criptográfica por hash de código
+# Executar a bateria completa das 22 suítes com validação criptográfica por hash de código
 $env:CEREBRO_PESSOAL_ACESSO = "permitido"
 .\.venv\Scripts\python.exe src/cli.py autotestes
+
+# Opcional: executar benchmark de carga multiprocesso + ONNX E5 em volume (~480+ registros)
+.\.venv\Scripts\python.exe scripts/benchmark_escala.py --fontes 120
 ```
 
-No Linux, execute `CEREBRO_PESSOAL_ACESSO=permitido ./.venv/bin/python src/cli.py autotestes`.
+No Linux ou macOS, execute `CEREBRO_PESSOAL_ACESSO=permitido ./.venv/bin/python src/cli.py autotestes`.
 
-O [GitHub Actions](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml) executa a bateria completa no Windows com Python 3.12 e no Ubuntu com Python 3.11 e 3.12. Os arquivos vetoriais são verificados por SHA-256 e os dados de teste são fictícios.
+O [GitHub Actions](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml) executa a bateria completa no Windows (Python 3.12), no Ubuntu (Python 3.11 e 3.12) e no macOS (Python 3.12). Os arquivos vetoriais são verificados por SHA-256 e os dados de teste são fictícios.
 
 Sem os recursos vetoriais e sem um caminho alternativo configurado, a suíte vetorial fica como `skipped` e o resultado geral fica `incomplete` se as demais passarem. Um caminho explícito inválido ou uma instalação parcial gera falha. As operações que exigem a bateria completa continuam condicionadas a um relatório `passed`.
 
 ### Principais Suítes Cobertas:
-- **`tests/testes_dashboard.py`**: Estados do painel, relatório de autotestes e configuração da busca vetorial.
+- **`tests/testes_dossie_studio.py`**: Fluxos de engenharia, jurídico e pesquisa do aplicativo Dossier Studio, recibos e segurança HTTP.
+- **`tests/testes_auditoria_escala.py`**: Escala com centenas de registros, vetores binários BLOB, normalização POSIX e endurecimento de contratos.
+- **`tests/testes_dashboard.py`**: Estados do painel, proteção CSRF/DNS Rebinding, relatório de autotestes e busca vetorial.
 - **`tests/testes.py`**: Integridade atômica, exclusão de arquivo pelo SO e digest SHA-256.
 - **`tests/testes_persistencia05.py`**: Concorrência de múltiplos processos e prevenção de dirty reads.
 - **`tests/testes_evidencias.py`**: Verificador determinístico de claims sem chamada a modelo.

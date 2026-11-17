@@ -27,7 +27,7 @@ def fetch_json(url,timeout=15):
         raise Invalid('destino de pesquisa fora do provedor autorizado')
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self,req,fp,code,msg,headers,newurl):raise Invalid('redirecionamento não autorizado')
-    request=urllib.request.Request(url,headers={'User-Agent':'CerebroPesquisa/0.4 (bounded local bibliographic client)'})
+    request=urllib.request.Request(url,headers={'User-Agent':'CerebroPesquisa/0.5 (bounded local bibliographic client)'})
     opener=urllib.request.build_opener(NoRedirect)
     with opener.open(request,timeout=timeout) as response:
         data=response.read(1500001)

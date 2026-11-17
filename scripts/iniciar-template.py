@@ -17,7 +17,9 @@ VAULT_DIRS = [
     "10_Entidades",
     "20_Afirmacoes",
     "30_Fontes",
+    "40_Avaliacoes",
     "50_Sinteses",
+    "60_Questoes",
     "70_Operacao",
     "80_Visoes"
 ]
@@ -40,11 +42,12 @@ def inicializar_novo_cofre(caminho_cofre: Path, nome_usuario: str = "Meu Cérebr
 
     # Inicializar os bancos de dados
     print("\n📦 Inicializando bancos relacionais e ledger atômico...")
-    os.environ.setdefault("EMC_SYSTEM", str(ROOT))
+    sys_root = Path(os.environ.get("EMC_SYSTEM", str(ROOT))).resolve()
+    os.environ.setdefault("EMC_SYSTEM", str(sys_root))
     os.environ.setdefault("EMC_VAULT", str(caminho_cofre.resolve()))
     from nucleo import Store
     from conhecimento import Knowledge
-    store = Store(str(ROOT), str(caminho_cofre.resolve()))
+    store = Store(str(sys_root), str(caminho_cofre.resolve()))
     knowledge = Knowledge(store)
 
     # Criação da nota de boas-vindas / início

@@ -28,10 +28,10 @@ async def main():
         atomic_json(system/'execucao.json',cfg)
         atomic_json(system/'autonomia.json',dict(DEFAULTS,enabled=True,content_access='permitido',approved_code=code_hash()))
         launcher=root/'server.py'
-        launcher.write_text('import sys\nfrom unittest.mock import patch\nsys.path.insert(0,'+repr(str(REAL_SYSTEM/'src'))+')\nsys.path.insert(1,'+repr(str(REAL_SYSTEM/'tests'))+')\n'
+        launcher.write_text('import sys\nsys.path.insert(0,'+repr(str(REAL_SYSTEM/'src'))+')\nsys.path.insert(1,'+repr(str(REAL_SYSTEM/'tests'))+')\n'
             'import nucleo\noriginal=nucleo.Store.__init__\n'
             'def init(self,root='+repr(str(system))+',vault='+repr(str(vault))+'):\n original(self,root,vault)\n'
-            'with patch.object(nucleo.Store,"__init__",init):\n import ponte_pessoal as p\n'
+            'nucleo.Store.__init__=init\nimport ponte_pessoal as p\np.store=nucleo.Store()\n'
             'import execucao\nfrom apoio_testes04 import Model,transport\n'
             'real=execucao.Engine.__init__\n'
             'def engine(self,sources,*args,**kwargs):\n kwargs["model_factory"]=lambda root:Model(sources)\n kwargs["transport"]=transport\n real(self,sources,*args,**kwargs)\n'
@@ -41,7 +41,7 @@ async def main():
         async with stdio_client(params) as (r,w):
             async with ClientSession(r,w) as session:
                 await session.initialize()
-                state=await call(session,'estado',{});assert state['version']=='0.4' and state['vault']==str(vault)
+                state=await call(session,'estado',{});assert state['version']=='0.5' and state['vault']==str(vault)
                 source=await call(session,'registrar_fonte',{'operation_key':'identity','titulo':'Identidade fictícia','conteudo':'Lara é uma pessoa fictícia.'})
                 entity=await call(session,'registrar_conhecimento',{'operation_key':'person','tipo':'entity','titulo':'Lara fictícia',
                     'payload':{'entity_kind':'person','display_name':'Lara','origin_refs':[{'record_id':source['id'],'revision':1}],'identity_status':'identified'}})
