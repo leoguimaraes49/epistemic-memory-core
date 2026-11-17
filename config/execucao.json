@@ -3,6 +3,7 @@
   "model": {
     "enabled": false,
     "executable": "",
+    "windows_codex_fallback": false,
     "model": "gpt-6.1-terra"
   },
   "embeddings": {

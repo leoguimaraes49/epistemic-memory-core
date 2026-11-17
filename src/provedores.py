@@ -1,8 +1,103 @@
 """Cliente textual pela conta já autenticada, sem ferramentas ou cópia de tokens."""
 import json,os,sqlite3,subprocess,time,hashlib
+import re
+import stat
 from pathlib import Path
 from contextlib import contextmanager
 from nucleo import Invalid,Conflict,canon
+
+
+_VERSION_DIR = re.compile(r'[0-9a-fA-F]{8,64}')
+_SIGNATURE_TIMEOUT_SECONDS = 20
+_SIGNATURE_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1')
+$signature = Get-AuthenticodeSignature -LiteralPath $env:EMC_CODEX_SIGNATURE_CANDIDATE
+if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate) { exit 1 }
+$publisher = $signature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+if ($publisher -cne 'OpenAI OpCo, LLC') { exit 1 }
+Write-Output 'verified'
+"""
+
+
+def _windows_codex_root():
+    local_app_data = os.environ.get('LOCALAPPDATA')
+    if os.name == 'nt' and local_app_data:
+        return Path(local_app_data) / 'OpenAI' / 'Codex' / 'bin'
+    return None
+
+
+def _regular_metadata(path):
+    """Descarta também pontos de redirecionamento do Windows no Python 3.11."""
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return None
+    attributes = getattr(metadata, 'st_file_attributes', 0)
+    if stat.S_ISLNK(metadata.st_mode) or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        return None
+    return metadata
+
+
+def _signed_by_openai(path, timeout):
+    shell = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'
+    environment = {name: value for name, value in os.environ.items() if name.upper() != 'PSMODULEPATH'}
+    environment['EMC_CODEX_SIGNATURE_CANDIDATE'] = str(path)
+    try:
+        result = subprocess.run(
+            [str(shell), '-NoProfile', '-NonInteractive', '-Command', _SIGNATURE_SCRIPT],
+            env=environment, capture_output=True, timeout=timeout,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == b'verified'
+
+
+def _resolve_executable(config, deadline):
+    configured = config.get('executable')
+    if not isinstance(configured, str) or not configured:
+        raise Invalid('caminho do executável do cliente ausente')
+    executable = Path(configured)
+    if executable.is_file():
+        return executable.absolute()
+
+    root = _windows_codex_root() if config.get('windows_codex_fallback') is True else None
+    try:
+        allowed = (
+            root is not None and executable.is_absolute() and executable.parent.parent == root
+            and executable.name.lower() == 'codex.exe' and _VERSION_DIR.fullmatch(executable.parent.name)
+            and _regular_metadata(root) is not None and root.resolve() == root
+        )
+        if allowed:
+            candidates = []
+            for folder in root.iterdir():
+                if not _VERSION_DIR.fullmatch(folder.name):
+                    continue
+                directory = _regular_metadata(folder)
+                if not directory or not stat.S_ISDIR(directory.st_mode):
+                    continue
+                candidate = folder / 'codex.exe'
+                metadata = _regular_metadata(candidate)
+                if metadata and stat.S_ISREG(metadata.st_mode):
+                    candidates.append((metadata.st_mtime_ns, candidate, metadata))
+
+            candidates.sort(reverse=True)
+            for _, candidate, metadata in candidates[:4]:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                if _signed_by_openai(candidate, timeout=min(_SIGNATURE_TIMEOUT_SECONDS, remaining)):
+                    current = _regular_metadata(candidate)
+                    if current and (
+                        current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns
+                    ) == (
+                        metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns
+                    ) and candidate.resolve() == candidate:
+                        return candidate
+    except (OSError, RuntimeError):
+        pass
+    raise Invalid('executável do cliente indisponível; autenticação não foi avaliada')
 
 
 def parse_json(text):
@@ -16,6 +111,13 @@ def parse_json(text):
         return result
     def constant(value):raise Invalid('constante numérica não JSON')
     return json.loads(text,object_pairs_hook=pairs,parse_constant=constant)
+
+
+def _recorded_answer(row):
+    state, answer = row
+    if state != 'completed':
+        raise Conflict('chamada incerta/falha não é repetida automaticamente')
+    return parse_json(answer)
 
 
 class TextModel:
@@ -33,14 +135,18 @@ class TextModel:
     def call(self,prompt):
         if not self.config.get('enabled'):raise Invalid('provedor textual desabilitado')
         if len(prompt)>50000:raise Invalid('contexto excede limite configurado')
-        executable=Path(self.config['executable'])
-        if not executable.is_file():raise Invalid('cliente autenticado não encontrado')
         key=hashlib.sha256((self.config['model']+'\0'+prompt).encode()).hexdigest()
+        lookup = 'SELECT state,answer FROM calls WHERE key=?'
+        with self.connect() as connection:
+            row = connection.execute(lookup, (key,)).fetchone()
+        if row is not None:
+            return _recorded_answer(row)
+        executable = _resolve_executable(self.config, self.deadline)
         with self.connect() as c:
-            c.execute('BEGIN IMMEDIATE');row=c.execute('SELECT state,answer FROM calls WHERE key=?',(key,)).fetchone()
-            if row:
-                if row[0]=='completed':return parse_json(row[1])
-                raise Conflict('chamada incerta/falha não é repetida automaticamente')
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute(lookup, (key,)).fetchone()
+            if row is not None:
+                return _recorded_answer(row)
             if time.time()>=self.deadline or c.execute('SELECT count(*) FROM calls').fetchone()[0]>=self.max_calls:
                 raise Invalid('orçamento do modelo esgotado')
             c.execute('INSERT INTO calls VALUES(?,?,?,?,?)',(key,'reserved',None,None,None))

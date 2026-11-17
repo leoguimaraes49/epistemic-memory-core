@@ -313,6 +313,8 @@ Use o Python do ambiente virtual e o caminho absoluto do servidor. Para permitir
 
 No Linux, use caminhos absolutos para `.venv/bin/python` e `src/ponte_pessoal.py`.
 
+O processamento textual em segundo plano é opcional. O [guia do provedor textual](docs/guias/EXECUCAO-INTEGRADA.md#provedor-textual-e-atualização-do-cliente) explica como configurá-lo localmente e habilitar a recuperação do cliente após atualizações do Codex Desktop no Windows.
+
 ---
 
 ## Busca vetorial local
@@ -335,6 +337,8 @@ $env:CEREBRO_PESSOAL_ACESSO = "permitido"
 ```
 
 No Linux, execute `CEREBRO_PESSOAL_ACESSO=permitido ./.venv/bin/python src/cli.py autotestes`.
+
+O [GitHub Actions](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml) executa a bateria completa no Windows e no Ubuntu, com os dois arquivos vetoriais verificados por SHA-256 e dados de teste fictícios.
 
 Sem os recursos vetoriais e sem um caminho alternativo configurado, a suíte vetorial fica como `skipped` e o resultado geral fica `incomplete` se as demais passarem. Um caminho explícito inválido ou uma instalação parcial gera falha. As operações que exigem a bateria completa continuam condicionadas a um relatório `passed`.
 

@@ -83,6 +83,14 @@ O avaliador não está autorizado a instalar ferramentas, ampliar suas permissõ
 | Inícios de trabalhos da fila | Até 120 por hora, com fila limitada e prazo total |
 | Pesquisa externa por execução | Até três documentos; timeout e tamanho de resposta limitados |
 | Adoção automática | Apenas configuração de codec com comparação favorável |
+
+### Provedor textual e atualização do cliente
+
+O motor reutiliza uma resposta confirmada para o mesmo modelo e o mesmo pedido no banco daquela demanda, inclusive se o executável tiver saído do disco. A consulta não consome outra chamada. Uma chamada anterior com falha ou estado incerto segue bloqueada para repetição automática.
+
+O provedor vem desativado no template. Para configurá-lo, copie `config/execucao.json` para `execucao.json` na raiz da instalação. A cópia local tem precedência e fica ignorada pelo Git. Use um caminho absoluto em `model.executable` com o cliente já instalado e habilite `model.enabled`.
+
+Em instalações do Codex Desktop no Windows, `model.windows_codex_fallback` aceita `true` para continuar encontrando o cliente quando o caminho configurado em uma pasta versionada deixar de existir. A busca se limita às pastas versionadas abaixo de `%LOCALAPPDATA%\OpenAI\Codex\bin` e exige validação Authenticode pelo Windows com o publicador OpenAI OpCo, LLC. O caminho explícito existente continua tendo prioridade. Em outras instalações e sistemas, especifique o executável diretamente. Uma falha de localização é reportada antes de qualquer tentativa de autenticação ou reserva de chamada.
 | Dados históricos | Linha de base; sem extração ou reavaliação clínica em massa |
 | Aviso de tela | Não instalado; o usuário dispensou o aviso |
 

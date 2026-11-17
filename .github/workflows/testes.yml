@@ -1,0 +1,59 @@
+name: Suítes locais
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  testes:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CEREBRO_PESSOAL_ACESSO: permitido
+      PYTHONUTF8: "1"
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-execucao04.txt
+      - name: Instalar dependências
+        run: python -m pip install -r requirements-execucao04.txt
+      - name: Preparar os recursos vetoriais
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p modelos/e5-multilingual-small
+          cd modelos/e5-multilingual-small
+          base="https://huggingface.co/intfloat/multilingual-e5-small/resolve/614241f622f53c4eeff9890bdc4f31cfecc418b3"
+          curl --fail --location --retry 3 --max-time 300 --output model.onnx "$base/onnx/model.onnx"
+          curl --fail --location --retry 3 --max-time 120 --output tokenizer.json "$base/tokenizer.json"
+          sha256sum --check <<'CHECKSUMS'
+          ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665  model.onnx
+          0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39  tokenizer.json
+          CHECKSUMS
+      - name: Executar as suítes oficiais
+        shell: bash
+        run: |
+          python - <<'PY'
+          from autoteste import run_tests
+
+          report = run_tests(force=True)
+          for suite in report.get('suites', ()):
+              print(suite['suite'], suite['status'], suite['tests_run'] or '')
+              if not suite['passed']:
+                  print(suite['output'])
+          raise SystemExit(0 if report['status'] == 'passed' else 1)
+          PY
