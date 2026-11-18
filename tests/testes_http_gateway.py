@@ -799,6 +799,484 @@ class HttpGatewayEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(c_ok_conv, 200)
 
+    def test_historical_operation_receipts_on_replay_and_restart(self) -> None:
+        """Finding #1: lote A -> lote B -> lote C + replay antes e após reiniciar o gateway."""
+        # 1. Criar revisão 1 ("lote A", chave k1)
+        body_k1 = {
+            "operation_key": "k1",
+            "title": "Controle de Estoque Auditado",
+            "source_kind": "document",
+            "content": "lote A",
+        }
+        c1, _, raw1 = self._request("/api/v1/sources", method="POST", body=body_k1)
+        self.assertEqual(c1, 200)
+        res_k1 = json.loads(raw1)
+        self.assertFalse(res_k1["replayed"])
+        self.assertEqual(res_k1["revision"], 1)
+        self.assertEqual(res_k1["revision_count_at_operation"], 1)
+        self.assertEqual(res_k1["record"]["revision"], 1)
+        record_id = res_k1["record"]["id"]
+        sha_rev1 = res_k1["sha256"]
+        self.assertEqual(res_k1["record"]["sha256"], sha_rev1)
+        self.assertEqual(res_k1["current_state"]["current_revision"], 1)
+        self.assertEqual(res_k1["current_state"]["current_sha256"], sha_rev1)
+        self.assertEqual(res_k1["current_state"]["total_revisions"], 1)
+
+        # Entidade derivada pinada na revisão 1 (para testar histórico de newly_suspended_ids em k2)
+        body_ent1 = {
+            "operation_key": "knw-ent-rev1",
+            "record_type": "entity",
+            "title": "Projeto Logístico Lote",
+            "payload": {
+                "entity_kind": "project",
+                "purpose": "Rastreamento da remessa inicial",
+                "project_status": "active",
+                "identity_status": "identified",
+                "origin_refs": [{"record_id": record_id, "revision": 1}],
+            },
+        }
+        ce1, _, raw_e1 = self._request("/api/v1/knowledge", method="POST", body=body_ent1)
+        self.assertEqual(ce1, 200)
+        ent1_initial = json.loads(raw_e1)
+        self.assertFalse(ent1_initial["replayed"])
+        ent1_id = ent1_initial["record"]["id"]
+        ent1_sha_rev1 = ent1_initial["sha256"]
+
+        # 2. Retificar 1 -> 2 ("lote B", chave k2)
+        body_k2 = {
+            "operation_key": "k2",
+            "record_id": record_id,
+            "expected_revision": 1,
+            "reason": "Substituição da remessa para lote B",
+            "content": "lote B",
+        }
+        c2, _, raw2 = self._request("/api/v1/sources/rectify", method="POST", body=body_k2)
+        self.assertEqual(c2, 200)
+        res_k2 = json.loads(raw2)
+        self.assertFalse(res_k2["replayed"])
+        self.assertEqual(res_k2["from_revision"], 1)
+        self.assertEqual(res_k2["to_revision"], 2)
+        self.assertEqual(res_k2["revision"], 2)
+        self.assertEqual(res_k2["revision_count_at_operation"], 2)
+        self.assertEqual(res_k2["old_sha256"], sha_rev1)
+        sha_rev2 = res_k2["new_sha256"]
+        self.assertNotEqual(sha_rev2, sha_rev1)
+        self.assertEqual(res_k2["sha256"], sha_rev2)
+        self.assertEqual(res_k2["newly_suspended_ids"], [ent1_id])
+        self.assertIn("-lote A", res_k2["diff"])
+        self.assertIn("+lote B", res_k2["diff"])
+        self.assertFalse(any("lote C" in ln for ln in res_k2["diff"]))
+
+        # Segunda entidade pinada na revisão 2 (será suspensa apenas em k3, não em k2!)
+        ce2, _, raw_e2 = self._request(
+            "/api/v1/knowledge",
+            method="POST",
+            body={
+                "operation_key": "knw-ent-rev2",
+                "record_type": "entity",
+                "title": "Projeto Logístico Lote B",
+                "payload": {
+                    "entity_kind": "project",
+                    "purpose": "Rastreamento da segunda remessa",
+                    "project_status": "active",
+                    "identity_status": "identified",
+                    "origin_refs": [{"record_id": record_id, "revision": 2}],
+                },
+            },
+        )
+        self.assertEqual(ce2, 200)
+        ent2_id = json.loads(raw_e2)["record"]["id"]
+
+        # 3. Retificar 2 -> 3 ("lote C", chave k3)
+        body_k3 = {
+            "operation_key": "k3",
+            "record_id": record_id,
+            "expected_revision": 2,
+            "reason": "Consolidação final no lote C",
+            "content": "lote C",
+        }
+        c3, _, raw3 = self._request("/api/v1/sources/rectify", method="POST", body=body_k3)
+        self.assertEqual(c3, 200)
+        res_k3 = json.loads(raw3)
+        self.assertFalse(res_k3["replayed"])
+        self.assertEqual(res_k3["from_revision"], 2)
+        self.assertEqual(res_k3["to_revision"], 3)
+        self.assertEqual(res_k3["old_sha256"], sha_rev2)
+        sha_rev3 = res_k3["new_sha256"]
+        self.assertNotEqual(sha_rev3, sha_rev1)
+        self.assertNotEqual(sha_rev3, sha_rev2)
+        self.assertEqual(res_k3["newly_suspended_ids"], [ent2_id])
+
+        # Atualizar ent1 na revisão 2 e depois revisão 3 para validar replay histórico também em /api/v1/knowledge
+        body_ent1_v2 = {
+            "operation_key": "knw-ent-rev1-upd2",
+            "record_id": ent1_id,
+            "expected_revision": 1,
+            "record_type": "entity",
+            "title": "Projeto Logístico Lote (Rev 2)",
+            "payload": {
+                "entity_kind": "project",
+                "purpose": "Revalidado na remessa C preliminar",
+                "project_status": "active",
+                "identity_status": "identified",
+                "origin_refs": [{"record_id": record_id, "revision": 3}],
+            },
+        }
+        ce1_v2, _, raw_e1_v2 = self._request("/api/v1/knowledge", method="POST", body=body_ent1_v2)
+        self.assertEqual(ce1_v2, 200)
+        ent1_v2_out = json.loads(raw_e1_v2)
+        ent1_sha_rev2 = ent1_v2_out["sha256"]
+        self.assertNotEqual(ent1_sha_rev2, ent1_sha_rev1)
+
+        ce1_v3, _, raw_e1_v3 = self._request(
+            "/api/v1/knowledge",
+            method="POST",
+            body={
+                "operation_key": "knw-ent-rev1-upd3",
+                "record_id": ent1_id,
+                "expected_revision": 2,
+                "record_type": "entity",
+                "title": "Projeto Logístico Lote (Rev 3)",
+                "payload": {
+                    "entity_kind": "project",
+                    "purpose": "Revalidado na remessa C final",
+                    "project_status": "active",
+                    "identity_status": "identified",
+                    "origin_refs": [{"record_id": record_id, "revision": 3}],
+                },
+            },
+        )
+        self.assertEqual(ce1_v3, 200)
+        ent1_sha_rev3 = json.loads(raw_e1_v3)["sha256"]
+
+        def assert_replays(request_fn) -> None:
+            # Replay k1 (criação v1)
+            rc1, _, rraw1 = request_fn("/api/v1/sources", method="POST", body=body_k1)
+            self.assertEqual(rc1, 200)
+            rep1 = json.loads(rraw1)
+            self.assertTrue(rep1["replayed"])
+            self.assertEqual(rep1["revision"], 1)
+            self.assertEqual(rep1["record"]["revision"], 1)
+            self.assertEqual(rep1["sha256"], sha_rev1)
+            self.assertEqual(rep1["record"]["sha256"], sha_rev1)
+            self.assertNotEqual(rep1["sha256"], sha_rev3)
+            self.assertEqual(rep1["revision_count_at_operation"], 1)
+            self.assertEqual(rep1["current_state"]["current_revision"], 3)
+            self.assertEqual(rep1["current_state"]["current_sha256"], sha_rev3)
+            self.assertEqual(rep1["current_state"]["total_revisions"], 3)
+            self.assertEqual(rep1["current_state"]["currently_suspended_ids"], [ent2_id])
+
+            # Replay k2 (retificação 1 -> 2)
+            rc2, _, rraw2 = request_fn("/api/v1/sources/rectify", method="POST", body=body_k2)
+            self.assertEqual(rc2, 200)
+            rep2 = json.loads(rraw2)
+            self.assertTrue(rep2["replayed"])
+            self.assertEqual(rep2["from_revision"], 1)
+            self.assertEqual(rep2["to_revision"], 2)
+            self.assertEqual(rep2["revision"], 2)
+            self.assertEqual(rep2["old_sha256"], sha_rev1)
+            self.assertEqual(rep2["new_sha256"], sha_rev2)
+            self.assertEqual(rep2["sha256"], sha_rev2)
+            self.assertNotEqual(rep2["sha256"], sha_rev3)
+            self.assertEqual(rep2["revision_count_at_operation"], 2)
+            self.assertIn("-lote A", rep2["diff"])
+            self.assertIn("+lote B", rep2["diff"])
+            self.assertFalse(any("lote C" in ln for ln in rep2["diff"]))
+            self.assertEqual(rep2["newly_suspended_ids"], [ent1_id])
+            self.assertEqual(rep2["current_state"]["current_revision"], 3)
+            self.assertEqual(rep2["current_state"]["current_sha256"], sha_rev3)
+            self.assertEqual(rep2["current_state"]["total_revisions"], 3)
+            self.assertEqual(rep2["current_state"]["currently_suspended_ids"], [ent2_id])
+
+            # Replay conhecimento v1 e v2
+            rce1, _, rrawe1 = request_fn("/api/v1/knowledge", method="POST", body=body_ent1)
+            self.assertEqual(rce1, 200)
+            repe1 = json.loads(rrawe1)
+            self.assertTrue(repe1["replayed"])
+            self.assertEqual(repe1["revision"], 1)
+            self.assertEqual(repe1["sha256"], ent1_sha_rev1)
+            self.assertEqual(repe1["record"]["sha256"], ent1_sha_rev1)
+            self.assertEqual(repe1["current_state"]["current_revision"], 3)
+            self.assertEqual(repe1["current_state"]["current_sha256"], ent1_sha_rev3)
+
+            rce2, _, rrawe2 = request_fn("/api/v1/knowledge", method="POST", body=body_ent1_v2)
+            self.assertEqual(rce2, 200)
+            repe2 = json.loads(rrawe2)
+            self.assertTrue(repe2["replayed"])
+            self.assertEqual(repe2["from_revision"], 1)
+            self.assertEqual(repe2["to_revision"], 2)
+            self.assertEqual(repe2["old_sha256"], ent1_sha_rev1)
+            self.assertEqual(repe2["new_sha256"], ent1_sha_rev2)
+            self.assertEqual(repe2["sha256"], ent1_sha_rev2)
+            self.assertEqual(repe2["current_state"]["current_revision"], 3)
+
+        # 4. Replay na mesma instância do servidor
+        assert_replays(self._request)
+
+        # 5. Reiniciar completamente EpistemicGatewayRuntime + servidor HTTP sobre o MESMO workspace
+        restarted_runtime = EpistemicGatewayRuntime(
+            self.base / "sistema",
+            self.base / "cofre",
+            enable_embeddings=False,
+        )
+        restarted_token = "gw-restarted-operator-token"
+        restarted_srv = create_gateway_server(
+            restarted_runtime,
+            host="127.0.0.1",
+            port=0,
+            api_token=restarted_token,
+        )
+        restarted_port = restarted_srv.server_address[1]
+        restarted_thread = threading.Thread(target=restarted_srv.serve_forever, daemon=True)
+        restarted_thread.start()
+        try:
+            def request_restarted(path: str, *, method: str = "GET", body: dict | None = None):
+                hdrs = {"Authorization": f"Bearer {restarted_token}", "Content-Type": "application/json"}
+                raw_b = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{restarted_port}{path}",
+                    data=raw_b,
+                    headers=hdrs,
+                    method=method,
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.status, dict(resp.headers), resp.read().decode("utf-8")
+
+            assert_replays(request_restarted)
+
+            # 6. Reconstrução determinística se Store confirmou operação antes de existir linha em gateway_operacoes.sqlite3
+            with restarted_runtime._connect_ops() as conn:
+                conn.execute("DELETE FROM operation_receipts WHERE operation_key IN ('k1', 'k2')")
+            assert_replays(request_restarted)
+        finally:
+            restarted_srv.shutdown()
+            restarted_srv.server_close()
+            restarted_thread.join(timeout=3)
+
+    def test_local_trust_boundary_readonly_ui_token_vs_operator_write_token(self) -> None:
+        """Finding #3: ui_session_token ('read_only') vs api_token ('read_write')."""
+        # 1. Extrair ui_session_token de GET / como qualquer processo local faria
+        c_html, _, html = self._request("/", auth=False)
+        self.assertEqual(c_html, 200)
+        self.assertIn("Desbloquear Escrita (Token de Operador Bearer)", html)
+        self.assertIn('id="operator-write-token"', html)
+        self.assertNotIn(self.api_token, html)
+        m_tok = re.search(r"const\s+GW_UI_TOKEN\s*=\s*\"([a-f0-9]+)\"", html)
+        self.assertIsNotNone(m_tok)
+        ui_token = m_tok.group(1)  # type: ignore[union-attr]
+        self.assertEqual(ui_token, self.server.ui_token)  # type: ignore[attr-defined]
+
+        # 2. Preparar um registro inicial com o token de operador ('read_write')
+        c_seed, _, raw_seed = self._request(
+            "/api/v1/sources",
+            method="POST",
+            body={
+                "operation_key": "scope-test-src-1",
+                "title": "Fonte Escopo Confiança",
+                "source_kind": "document",
+                "content": json.dumps({"indicador": 42}, ensure_ascii=False),
+            },
+        )
+        self.assertEqual(c_seed, 200)
+        source_id = json.loads(raw_seed)["record"]["id"]
+
+        ui_headers = {"Authorization": f"Bearer {ui_token}"}
+
+        # 3. ui_session_token ('read_only') tem sucesso em GET /health, /graph, /lineage/<id> e busca sem mutação
+        c_uh, _, raw_uh = self._request("/api/v1/health", auth=False, headers=ui_headers)
+        self.assertEqual(c_uh, 200)
+        self.assertEqual(json.loads(raw_uh)["auth_scope"], "read_only")
+
+        c_ug, _, raw_ug = self._request("/api/v1/graph?include_superseded=true", auth=False, headers=ui_headers)
+        self.assertEqual(c_ug, 200)
+        self.assertEqual(len(json.loads(raw_ug)["nodes"]), 1)
+
+        c_ul, _, raw_ul = self._request(f"/api/v1/lineage/{source_id}", auth=False, headers=ui_headers)
+        self.assertEqual(c_ul, 200)
+        self.assertEqual(json.loads(raw_ul)["record"]["id"], source_id)
+
+        with self.runtime.knowledge.connect() as conn:
+            searches_before = conn.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
+        with self.runtime.retrieval.connect() as conn:
+            hist_before = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+
+        c_us, _, raw_us = self._request(
+            "/api/v1/search",
+            method="POST",
+            auth=False,
+            headers=ui_headers,
+            body={"query": "Fonte Escopo", "limit": 5, "depth": 1},
+        )
+        self.assertEqual(c_us, 200)
+        srch_ro = json.loads(raw_us)
+        self.assertTrue(srch_ro["read_only"])
+        self.assertEqual(len(srch_ro["results"]), 1)
+
+        with self.runtime.knowledge.connect() as conn:
+            searches_after = conn.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
+        with self.runtime.retrieval.connect() as conn:
+            hist_after = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+        self.assertEqual(searches_after, searches_before)
+        self.assertEqual(hist_after, hist_before)
+
+        # 4. TODOS os endpoints de escrita DEVEM rejeitar ui_session_token com HTTP 403 insufficient_scope
+        write_attempts = [
+            (
+                "/api/v1/sources",
+                {"operation_key": "unauth-src", "title": "Intruso", "content": "bloqueado"},
+            ),
+            (
+                "/api/v1/sources/rectify",
+                {
+                    "operation_key": "unauth-rect",
+                    "record_id": source_id,
+                    "expected_revision": 1,
+                    "reason": "Tentativa sem escopo",
+                    "content": "{}",
+                },
+            ),
+            (
+                "/api/v1/knowledge",
+                {
+                    "operation_key": "unauth-knw",
+                    "record_type": "entity",
+                    "title": "Entidade Não Autorizada",
+                    "payload": {
+                        "entity_kind": "project",
+                        "purpose": "Teste",
+                        "project_status": "active",
+                        "identity_status": "identified",
+                        "origin_refs": [{"record_id": source_id, "revision": 1}],
+                    },
+                },
+            ),
+            (
+                "/api/v1/verify-claims",
+                {
+                    "operation_key": "unauth-ver",
+                    "claims": [
+                        {
+                            "id": "ind",
+                            "kind": "field",
+                            "value": 42,
+                            "refs": [{"record_id": source_id, "revision": 1, "path": "/indicador"}],
+                        }
+                    ],
+                },
+            ),
+        ]
+        for endpoint, payload in write_attempts:
+            code_403, _, raw_403 = self._request(
+                endpoint,
+                method="POST",
+                auth=False,
+                headers=ui_headers,
+                body=payload,
+            )
+            self.assertEqual(code_403, 403, msg=f"Endpoint {endpoint} deveria rejeitar ui_session_token com 403")
+            err = json.loads(raw_403)
+            self.assertEqual(err["status"], "forbidden")
+            self.assertEqual(err["error"], "insufficient_scope")
+            self.assertEqual(err["required_scope"], "read_write")
+            self.assertEqual(err["current_scope"], "read_only")
+
+        # 5. Com o token de operador ('read_write'), leitura e todas as escritas têm sucesso
+        c_oh, _, raw_oh = self._request("/api/v1/health")
+        self.assertEqual(c_oh, 200)
+        self.assertEqual(json.loads(raw_oh)["auth_scope"], "read_write")
+
+        c_ok_knw, _, _ = self._request("/api/v1/knowledge", method="POST", body=write_attempts[2][1])
+        self.assertEqual(c_ok_knw, 200)
+        c_ok_ver, _, _ = self._request("/api/v1/verify-claims", method="POST", body=write_attempts[3][1])
+        self.assertEqual(c_ok_ver, 200)
+        c_ok_rect, _, _ = self._request("/api/v1/sources/rectify", method="POST", body=write_attempts[1][1])
+        self.assertEqual(c_ok_rect, 200)
+
+    def test_cli_cleanup_preserves_preexisting_files_and_unauthorized_scope_leaves_empty_folder(self) -> None:
+        """Findings #2 & #7: --cleanup preserva sentinel.txt; escopo não autorizado mantém pasta vazia."""
+        from unittest import mock
+        from nucleo import Invalid
+        import apps.http_gateway.cli as gw_cli
+
+        # (a) CLI --workspace <dir_com_sentinel> --cleanup demo preserva sentinel.txt em sucesso e em falha!
+        existing_project = self.base / "existing_user_project"
+        existing_project.mkdir(parents=True, exist_ok=True)
+        sentinel = existing_project / "sentinel.txt"
+        sentinel.write_text("projeto preexistente intacto", encoding="utf-8")
+
+        env = dict(os.environ, PYTHONUTF8="1")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "apps" / "http_gateway" / "cli.py"),
+                "--workspace",
+                str(existing_project),
+                "--no-embeddings",
+                "--cleanup",
+                "demo",
+            ],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+        demo_out = json.loads(proc.stdout)
+        self.assertTrue(demo_out["workspace_cleaned_up"])
+        self.assertTrue(sentinel.is_file())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "projeto preexistente intacto")
+        self.assertEqual(list(existing_project.iterdir()), [sentinel])
+
+        # Falha forçada durante inicialização e durante execução da demo com --cleanup
+        prev_env = dict(os.environ)
+        try:
+            with mock.patch.object(gw_cli, "EpistemicGatewayRuntime", side_effect=RuntimeError("falha init simulada")):
+                with self.assertRaises(RuntimeError):
+                    gw_cli.main(["--workspace", str(existing_project), "--no-embeddings", "--cleanup", "demo"])
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual(list(existing_project.iterdir()), [sentinel])
+
+            with mock.patch.object(gw_cli, "_run_http_demo", side_effect=RuntimeError("falha demo simulada")):
+                with self.assertRaises(RuntimeError):
+                    gw_cli.main(["--workspace", str(existing_project), "--no-embeddings", "--cleanup", "demo"])
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual(list(existing_project.iterdir()), [sentinel])
+        finally:
+            os.environ.clear()
+            os.environ.update(prev_env)
+
+        # (b) Finding #7: inicialização programática fora do escopo autorizado falha sem criar NENHUM diretório/arquivo
+        with tempfile.TemporaryDirectory(prefix="emc-unauth-gw-") as ext_tmp:
+            unauth_folder = Path(ext_tmp)
+            saved_auth_roots = os.environ.pop("EMC_AUTHORIZED_ROOTS", None)
+            try:
+                with self.assertRaises(Invalid):
+                    EpistemicGatewayRuntime.from_workspace(unauth_folder, enable_embeddings=False)
+                self.assertEqual(list(unauth_folder.iterdir()), [])
+
+                with self.assertRaises(Invalid):
+                    EpistemicGatewayRuntime(
+                        unauth_folder / "sistema",
+                        unauth_folder / "cofre",
+                        enable_embeddings=False,
+                    )
+                self.assertEqual(list(unauth_folder.iterdir()), [])
+
+                # Quando explicitamente autorizado via EMC_AUTHORIZED_ROOTS, inicializa e grava fonte com sucesso
+                os.environ["EMC_AUTHORIZED_ROOTS"] = str(unauth_folder)
+                ext_rt = EpistemicGatewayRuntime.from_workspace(unauth_folder, enable_embeddings=False)
+                created = ext_rt.create_source(
+                    {"operation_key": "ext-auth-1", "title": "Fonte Autorizada", "content": "ok"}
+                )
+                self.assertEqual(created["revision"], 1)
+                self.assertEqual(ext_rt.store.read(created["record"]["id"])["payload"]["content"], "ok")
+            finally:
+                if saved_auth_roots is None:
+                    os.environ.pop("EMC_AUTHORIZED_ROOTS", None)
+                else:
+                    os.environ["EMC_AUTHORIZED_ROOTS"] = saved_auth_roots
+
 
 if __name__ == "__main__":
     unittest.main()

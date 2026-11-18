@@ -112,6 +112,24 @@ GATEWAY_HTML_TEMPLATE = """<!DOCTYPE html>
   button.sec:hover { border-color: var(--accent); }
   button.sec.active-filter { border-color: var(--accent); background: rgba(56, 189, 248, 0.18); color: var(--accent); }
   button.warn { background: var(--suspended); color: #06101e; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .auth-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin-bottom: 16px;
+    justify-content: space-between;
+  }
+  .auth-bar input {
+    margin: 0;
+    width: 310px;
+    max-width: 100%;
+  }
 
   .workspace-grid {
     display: grid;
@@ -213,15 +231,38 @@ GATEWAY_HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="wrap">
   <header>
     <div>
-      <h1>🕸️ Epistemic HTTP Gateway <span class="badge" id="hdr-mode">REST v1 · Verificando...</span></h1>
+      <h1>
+        🕸️ Epistemic HTTP Gateway
+        <span class="badge" id="hdr-mode">REST v1 · Verificando...</span>
+        <span class="badge badge-suspended" id="hdr-auth-scope">🔒 Modo Somente Leitura (read_only)</span>
+      </h1>
       <p class="sub">Gateway REST JSON Poliglota + Inspetor Visual SVG de Linhagem, Hashes SHA-256 e Raio de Impacto (Stale-on-Write)</p>
     </div>
     <div class="btn-row">
-      <button class="sec" id="btn-seed">🌱 Popular Grafo Demo via REST</button>
-      <button class="warn" id="btn-rectify-demo">⚡ Retificar Fonte Primária (Cascata)</button>
+      <button class="sec" id="btn-seed" disabled title="Desbloqueie a escrita com o Token de Operador Bearer abaixo">🌱 Popular Grafo Demo via REST</button>
+      <button class="warn" id="btn-rectify-demo" disabled title="Desbloqueie a escrita com o Token de Operador Bearer abaixo">⚡ Retificar Fonte Primária (Cascata)</button>
       <button class="sec" id="btn-refresh">🔄 Sincronizar Grafo</button>
     </div>
   </header>
+
+  <div class="auth-bar">
+    <div class="sub">
+      <strong>Fronteira de Confiança Local:</strong> A página inicia com sessão <code>read_only</code> (inspeção de grafo e linhagem). Para mutações REST, informe o token Bearer do operador em memória JS:
+    </div>
+    <div class="btn-row">
+      <label for="operator-write-token" class="sub" style="font-weight:600">Desbloquear Escrita (Token de Operador Bearer)</label>
+      <input
+        type="password"
+        id="operator-write-token"
+        class="mono"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Cole o Bearer Token de operador (read_write)..."
+      >
+      <button id="btn-unlock-write" type="button">🔓 Desbloquear Escrita</button>
+      <button class="sec" id="btn-lock-write" type="button" style="display:none">🔒 Voltar para Leitura</button>
+    </div>
+  </div>
 
   <div class="kpi-grid">
     <div class="card">
@@ -343,9 +384,13 @@ GATEWAY_HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
+(() => {
 const GW_UI_TOKEN = __GW_UI_TOKEN_JSON__;
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+// Mantido exclusivamente em memória de closure JS; nunca persistido em disco/storage.
+let operatorWriteToken = "";
+let currentAuthScope = "read_only";
 let graphState = { nodes: [], edges: [], superseded_revisions: [], receipts: [] };
 let activeFilter = "all";
 let selectedNodeId = null;
@@ -360,15 +405,43 @@ function escapeHtml(val) {
     .replace(/'/g, "&#39;");
 }
 
-function getBearerToken() {
-  const custom = document.getElementById("rest-token-override").value.trim();
-  return custom || GW_UI_TOKEN;
+function updateWriteControlsUi() {
+  const scopeBadge = document.getElementById("hdr-auth-scope");
+  const seedBtn = document.getElementById("btn-seed");
+  const rectBtn = document.getElementById("btn-rectify-demo");
+  const lockBtn = document.getElementById("btn-lock-write");
+  const isRw = currentAuthScope === "read_write" && Boolean(operatorWriteToken);
+  if (isRw) {
+    scopeBadge.className = "badge badge-active";
+    scopeBadge.textContent = "🔓 Escrita Desbloqueada (read_write)";
+    seedBtn.disabled = false;
+    rectBtn.disabled = false;
+    seedBtn.title = "Popula registros demonstrativos usando o Token de Operador Bearer";
+    rectBtn.title = "Retifica a fonte primária na revisão 1 usando o Token de Operador Bearer";
+    lockBtn.style.display = "inline-block";
+  } else {
+    scopeBadge.className = "badge badge-suspended";
+    scopeBadge.textContent = "🔒 Modo Somente Leitura (read_only)";
+    seedBtn.disabled = true;
+    rectBtn.disabled = true;
+    seedBtn.title = "Desbloqueie a escrita com o Token de Operador Bearer";
+    rectBtn.title = "Desbloqueie a escrita com o Token de Operador Bearer";
+    lockBtn.style.display = "none";
+  }
 }
 
-async function gwFetch(path, method = "GET", bodyObj = null) {
+function getBearerToken(explicitToken = null) {
+  if (explicitToken) return explicitToken;
+  const custom = document.getElementById("rest-token-override").value.trim();
+  if (custom) return custom;
+  if (operatorWriteToken) return operatorWriteToken;
+  return GW_UI_TOKEN;
+}
+
+async function gwFetch(path, method = "GET", bodyObj = null, explicitToken = null) {
   const t0 = performance.now();
   const headers = {
-    "Authorization": "Bearer " + getBearerToken(),
+    "Authorization": "Bearer " + getBearerToken(explicitToken),
     "Accept": "application/json"
   };
   const opts = { method, headers };
@@ -930,6 +1003,59 @@ async function rectifyDemoSource() {
   await refreshDashboard();
 }
 
+async function unlockWriteMode() {
+  const input = document.getElementById("operator-write-token");
+  const candidate = input.value.trim();
+  const pill = document.getElementById("rest-status-pill");
+  if (!candidate) {
+    pill.className = "badge badge-danger";
+    pill.textContent = "Token vazio";
+    document.getElementById("rest-output").textContent = "Informe o Token de Operador Bearer para desbloquear operações de escrita.";
+    return;
+  }
+  const check = await gwFetch("/api/v1/health", "GET", null, candidate);
+  if (check.httpStatus === 200 && check.data && check.data.auth_scope === "read_write") {
+    operatorWriteToken = candidate;
+    currentAuthScope = "read_write";
+    input.value = "";
+    updateWriteControlsUi();
+    pill.className = "badge badge-active";
+    pill.textContent = "Escrita Desbloqueada (read_write)";
+    document.getElementById("rest-output").textContent = JSON.stringify(
+      { status: "ok", auth_scope: "read_write", note: "Token mantido apenas em memória JS desta aba." },
+      null,
+      2
+    );
+    await refreshDashboard();
+  } else {
+    operatorWriteToken = "";
+    currentAuthScope = "read_only";
+    updateWriteControlsUi();
+    pill.className = "badge badge-danger";
+    pill.textContent = "Credencial rejeitada (HTTP " + check.httpStatus + ")";
+    document.getElementById("rest-output").textContent = JSON.stringify(check.data, null, 2);
+  }
+}
+
+function lockWriteMode() {
+  operatorWriteToken = "";
+  currentAuthScope = "read_only";
+  document.getElementById("operator-write-token").value = "";
+  updateWriteControlsUi();
+  const pill = document.getElementById("rest-status-pill");
+  pill.className = "badge badge-suspended";
+  pill.textContent = "Modo Leitura (read_only)";
+}
+
+document.getElementById("btn-unlock-write").addEventListener("click", unlockWriteMode);
+document.getElementById("btn-lock-write").addEventListener("click", lockWriteMode);
+document.getElementById("operator-write-token").addEventListener("keydown", ev => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    unlockWriteMode();
+  }
+});
+
 document.getElementById("btn-refresh").addEventListener("click", refreshDashboard);
 document.getElementById("btn-seed").addEventListener("click", seedDemoViaRest);
 document.getElementById("btn-rectify-demo").addEventListener("click", rectifyDemoSource);
@@ -977,9 +1103,11 @@ document.getElementById("btn-send-rest").addEventListener("click", async () => {
 });
 
 window.addEventListener("DOMContentLoaded", async () => {
+  updateWriteControlsUi();
   await refreshDashboard();
   applyPreset();
 });
+})();
 </script>
 </body>
 </html>

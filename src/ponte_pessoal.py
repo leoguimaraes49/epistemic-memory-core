@@ -1,5 +1,6 @@
 """Ponte MCP pessoal 0.5: confirmação, comprovantes e complementação local."""
-import os, json, hashlib, threading, sqlite3
+import os, json, hashlib, stat, threading, sqlite3
+from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 from nucleo import Store,Conflict,Uncertain,Locked,Invalid,REAL_VAULT,REAL_SYSTEM,config_file
 from conhecimento import Knowledge
@@ -50,18 +51,77 @@ def estado() -> dict:
             'limits':'Sem diagnóstico, garantia de zero erros, criptografia do cofre, exclusão de cópias externas ou autenticação por IA. Mudanças arbitrárias de código não são auto-adotadas.'}
 
 
+def _is_redirected(path: Path) -> bool:
+    if path.is_symlink() or getattr(path,'is_junction',lambda:False)():
+        return True
+    try:
+        tag=getattr(os.lstat(path),'st_reparse_tag',0)
+        return tag in (getattr(stat,'IO_REPARSE_TAG_SYMLINK',0xA000000C),
+                       getattr(stat,'IO_REPARSE_TAG_MOUNT_POINT',0xA0000003))
+    except OSError:
+        return False
+
+
 @server.tool()
 def ler_manual(nome: str) -> dict:
     """Lê somente o índice ou um capítulo do manual integral, sem dados pessoais."""
-    pasta=REAL_VAULT/'00_Manual'
-    manifesto=json.loads(config_file(REAL_SYSTEM,'manual_manifest.json').read_text(encoding='utf-8'))
+    if (not isinstance(nome,str) or not nome or '\x00' in nome or '/' in nome or '\\' in nome
+            or ':' in nome or nome in ('.','..') or Path(nome).name!=nome):
+        return {'status':'denied','reason':'Arquivo fora do manual autorizado'}
+    sys_base=Path(REAL_SYSTEM); vault_base=Path(REAL_VAULT)
+    if _is_redirected(sys_base) or _is_redirected(vault_base):
+        return {'status':'denied','reason':'Manual fora do escopo autorizado'}
+    cfg_dir=sys_base/'config'
+    direct_manifest=sys_base/'manual_manifest.json'
+    cfg_manifest=cfg_dir/'manual_manifest.json'
+    if (_is_redirected(cfg_dir)
+            or (cfg_dir.exists() and cfg_dir.resolve().parent!=sys_base.resolve())
+            or _is_redirected(direct_manifest)
+            or _is_redirected(cfg_manifest)):
+        return {'status':'denied','reason':'Manual fora do escopo autorizado'}
+    manifest_path=config_file(sys_base,'manual_manifest.json')
+    if _is_redirected(manifest_path):
+        return {'status':'denied','reason':'Manual fora do escopo autorizado'}
+    if manifest_path.exists():
+        expected_parent=sys_base.resolve() if manifest_path==direct_manifest else cfg_dir.resolve()
+        if not manifest_path.is_file() or manifest_path.resolve().parent!=expected_parent:
+            return {'status':'denied','reason':'Manual fora do escopo autorizado'}
+        try:manifesto=json.loads(manifest_path.read_text(encoding='utf-8'))
+        except (OSError,ValueError):return {'status':'invalid','reason':'Manifesto do manual inválido'}
+        if not isinstance(manifesto,dict):return {'status':'invalid','reason':'Manifesto do manual inválido'}
+    else:
+        try:
+            from recursos_pacote import load_manual_manifest
+            manifesto=load_manual_manifest()
+        except (ImportError,Invalid,Conflict,OSError):
+            return {'status':'denied','reason':'Manifesto do manual indisponível'}
     if nome not in manifesto:return {'status':'denied','reason':'Arquivo fora do manual autorizado'}
+    pasta=vault_base/'00_Manual'
+    if _is_redirected(pasta) or (pasta.exists() and pasta.resolve().parent!=vault_base.resolve()):
+        return {'status':'denied','reason':'Manual fora do escopo autorizado'}
     p=pasta/nome
-    if not p.exists() and not p.is_symlink() and (REAL_SYSTEM/'00_Manual'/nome).exists():
-        pasta=REAL_SYSTEM/'00_Manual'
-        p=pasta/nome
-    if p.is_symlink() or p.resolve().parent!=pasta.resolve():return {'status':'denied'}
-    conteudo=p.read_bytes()
+    if _is_redirected(p) or (p.exists() and p.resolve().parent!=pasta.resolve()):
+        return {'status':'denied','reason':'Manual fora do escopo autorizado'}
+    if not p.exists():
+        sys_pasta=sys_base/'00_Manual'
+        if _is_redirected(sys_pasta) or (sys_pasta.exists() and sys_pasta.resolve().parent!=sys_base.resolve()):
+            return {'status':'denied','reason':'Manual fora do escopo autorizado'}
+        sys_p=sys_pasta/nome
+        if _is_redirected(sys_p) or (sys_p.exists() and sys_p.resolve().parent!=sys_pasta.resolve()):
+            return {'status':'denied','reason':'Manual fora do escopo autorizado'}
+        if sys_p.exists():
+            pasta=sys_pasta; p=sys_p
+    if p.exists():
+        if not p.is_file():return {'status':'denied','reason':'Manual fora do escopo autorizado'}
+        conteudo=p.read_bytes()
+    else:
+        try:
+            from recursos_pacote import read_manual_bytes
+            conteudo=read_manual_bytes(nome)
+        except Conflict:
+            return {'status':'invalid','reason':'Manual alterado; revisão do manifesto necessária'}
+        except (ImportError,Invalid,OSError):
+            return {'status':'denied','reason':'Capítulo indisponível no cofre local e no pacote instalado'}
     if hashlib.sha256(conteudo).hexdigest()!=manifesto[nome]:return {'status':'invalid','reason':'Manual alterado; revisão do manifesto necessária'}
     return {'status':'ok','content':conteudo.decode('utf-8-sig')}
 

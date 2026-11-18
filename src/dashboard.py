@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT))
 import ponte_pessoal as p
 
 MAX_POST_BYTES = 65536
+_MAX_DRAIN_BYTES = 262144
+_DRAIN_CHUNK_BYTES = 16384
 SESSION_TOKEN = secrets.token_hex(24)
 _ALLOWED_HOST_RE = re.compile(r'^(?:127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$', re.I)
 
@@ -548,6 +550,39 @@ def _is_allowed_host(host_header):
 class DashboardHandler(BaseHTTPRequestHandler):
     csrf_token = SESSION_TOKEN
 
+    def _init_request_tracking(self):
+        self._body_consumed = False
+
+    def _drain_unconsumed_body(self):
+        """Drena corpos pequenos/moderados antes de fechar em erro >= 400 (evita TCP RST no Windows)."""
+        if getattr(self, '_body_consumed', False):
+            return
+        self._body_consumed = True
+        if self.command in ('GET', 'HEAD'):
+            return
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+        except (TypeError, ValueError):
+            return
+        if length <= 0 or length > _MAX_DRAIN_BYTES:
+            return
+        prev_timeout = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(0.5)
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, _DRAIN_CHUNK_BYTES))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                self.connection.settimeout(prev_timeout)
+            except OSError:
+                pass
+
     def _check_host(self):
         if not _is_allowed_host(self.headers.get('Host', '')):
             self.send_json({'status': 'denied', 'reason': 'Host HTTP não autorizado'}, code=403)
@@ -572,18 +607,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return True
 
     def _read_json_body(self):
+        if self.headers.get('Transfer-Encoding'):
+            self._body_consumed = True
+            self.send_json({'status': 'invalid', 'reason': 'Transfer-Encoding não suportado'}, code=411)
+            return None
         raw_len = self.headers.get('Content-Length', '0')
         try:
             length = int(raw_len)
         except (TypeError, ValueError):
+            self._body_consumed = True
             self.send_json({'status': 'invalid', 'reason': 'Content-Length inválido'}, code=400)
             return None
         if length < 0:
+            self._body_consumed = True
             self.send_json({'status': 'invalid', 'reason': 'Content-Length negativo'}, code=400)
             return None
         if length > MAX_POST_BYTES:
+            self._drain_unconsumed_body()
             self.send_json({'status': 'invalid', 'reason': 'Corpo excede limite de 64 KB'}, code=413)
             return None
+        self._body_consumed = True
         if length == 0:
             return {}
         try:
@@ -597,6 +640,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return payload
 
     def do_GET(self):
+        self._init_request_tracking()
         if not self._check_host():
             return
         url = urllib.parse.urlparse(self.path)
@@ -604,12 +648,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             rendered = HTML_PAGE.replace('__EMC_CSRF_TOKEN__', self.csrf_token).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(rendered)))
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')
             self.send_header('Cache-Control', 'no-store')
             self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'")
             self.end_headers()
-            self.wfile.write(rendered)
+            try:
+                self.wfile.write(rendered)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
         elif url.path == '/api/estado':
             self.send_json(p.estado())
         elif url.path == '/api/diagnostico':
@@ -626,6 +675,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({'status': 'not_found', 'reason': 'Não encontrado'}, code=404)
 
     def do_POST(self):
+        self._init_request_tracking()
         if not self._check_host() or not self._check_csrf():
             return
         data = self._read_json_body()
@@ -646,18 +696,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json({'status': 'not_found', 'reason': 'Endpoint não encontrado'}, code=404)
 
     def send_json(self, data, code=200):
-        payload_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
         if code >= 400:
+            self._drain_unconsumed_body()
             self.close_connection = True
+        payload_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(payload_bytes)))
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Cache-Control', 'no-store')
+        if code >= 400:
+            self.send_header('Connection', 'close')
         self.end_headers()
-        self.wfile.write(payload_bytes)
-        self.wfile.flush()
+        try:
+            self.wfile.write(payload_bytes)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def log_message(self, format, *args):
         # Silencia logs de polling do dashboard no terminal

@@ -2,14 +2,54 @@
 import array,hashlib,json,math,sqlite3,struct,sys
 from pathlib import Path
 from contextlib import contextmanager
-from nucleo import Invalid,Conflict,canon,sha,NOW
+from nucleo import Invalid,Conflict,canon,sha,NOW,config_file
 from conhecimento import Knowledge,refs
+
+SUPPORTED_VECTOR_STORAGE=('json','packed_f64')
 
 
 def _pack_vector(vector):
     arr=array.array('d',(float(x) for x in vector))
     if sys.byteorder!='little':arr.byteswap()
     return arr.tobytes()
+
+
+def _encode_vector(vector,vector_storage):
+    vals=[float(x) for x in vector]
+    if not vals or not all(math.isfinite(x) for x in vals):
+        raise Invalid('vetor inválido para persistência')
+    if vector_storage=='json':
+        return canon(vals)
+    if vector_storage=='packed_f64':
+        return _pack_vector(vals)
+    raise Invalid('formato de armazenamento vetorial desconhecido')
+
+
+def _resolve_vector_storage(sources,vector_storage):
+    if vector_storage is None:
+        root=getattr(sources,'root',None)
+        if root is not None:
+            cfg_path=config_file(root,'execucao.json')
+            if cfg_path.is_symlink():
+                raise Invalid('configuração redirecionada')
+            if cfg_path.exists():
+                try:
+                    raw=json.loads(cfg_path.read_text(encoding='utf-8'))
+                except ValueError as error:
+                    raise Invalid('configuração de execução inválida') from error
+                if not isinstance(raw,dict):
+                    raise Invalid('configuração de execução inválida')
+                emb=raw.get('embeddings',{})
+                if not isinstance(emb,dict):
+                    raise Invalid('configuração de provedor inválida: embeddings')
+                vector_storage=emb.get('vector_storage','packed_f64')
+            else:
+                vector_storage='packed_f64'
+        else:
+            vector_storage='packed_f64'
+    if not isinstance(vector_storage,str) or vector_storage not in SUPPORTED_VECTOR_STORAGE:
+        raise Invalid('formato de armazenamento vetorial desconhecido')
+    return vector_storage
 
 
 def _unpack_vector(raw,expected_dim=None):
@@ -134,8 +174,9 @@ class LocalEmbeddings:
 
 
 class Retrieval:
-    def __init__(self,sources,embedder=None,scope='proprietario_local'):
+    def __init__(self,sources,embedder=None,scope='proprietario_local',vector_storage=None):
         self.sources=sources;self.k=Knowledge(sources);self.embedder=embedder;self.scope=scope
+        self.vector_storage=_resolve_vector_storage(sources,vector_storage)
         self.db=sources.root/'estado'/'recuperacao.sqlite3'
         with self.connect() as c:
             c.executescript('''CREATE TABLE IF NOT EXISTS vectors(id TEXT,part INTEGER,digest TEXT,value TEXT,PRIMARY KEY(id,part));
@@ -157,7 +198,8 @@ class Retrieval:
         if not isinstance(query,str) or not query.strip() or len(query)>500 or type(limit)is not int or not 1<=limit<=50 or type(depth)is not int or not 0<=depth<=2:
             raise Invalid('consulta fora dos limites')
         generation,records,invalid,issues=self.snapshot()
-        key=sha(canon([query,limit,depth,self.scope,bool(self.embedder),'rrf-v3-lexical-ranked-context-reserved']).encode())
+        cache_fmt=self.vector_storage if self.embedder else 'lexical_only'
+        key=sha(canon([query,limit,depth,self.scope,bool(self.embedder),cache_fmt,'rrf-v3-lexical-ranked-context-reserved']).encode())
         with self.connect() as c:cached=c.execute('SELECT generation,result FROM cache WHERE key=?',(key,)).fetchone()
         if cached and cached[0]==generation:
             result=json.loads(cached[1]);result['cache_reused']=True
@@ -179,13 +221,15 @@ class Retrieval:
             for ident,record in eligible.items():
                 text=record['title']+'\n'+canon(record['payload']);digest=sha(text.encode())
                 existing_parts=grouped.get(ident)
-                valid_stored=(
-                    bool(existing_parts)
-                    and [p for p,_,_ in existing_parts]==list(range(len(existing_parts)))
-                    and all(d==digest and _unpack_vector(v,expected_dim=expected_dim) is not None for _,d,v in existing_parts)
-                )
+                contiguous=bool(existing_parts) and [p for p,_,_ in existing_parts]==list(range(len(existing_parts)))
+                decoded=[_unpack_vector(v,expected_dim=expected_dim) if d==digest else None for _,d,v in existing_parts] if contiguous else []
+                all_decoded=bool(decoded) and all(vec is not None for vec in decoded)
+                format_ok=(all(isinstance(v,str) if self.vector_storage=='json' else isinstance(v,(bytes,memoryview))
+                               for _,_,v in existing_parts) if all_decoded else False)
+                valid_stored=all_decoded and format_ok
                 if not valid_stored:
-                    updates[ident]=(digest,self.embedder.chunks(text))
+                    vectors_list=[vec.tolist() for vec in decoded] if all_decoded else self.embedder.chunks(text)
+                    updates[ident]=(digest,vectors_list)
             stale_ids=set(grouped)-set(eligible)
             if updates or stale_ids:
                 if self.snapshot()[0]!=generation:raise Conflict('base mudou durante atualização do índice')
@@ -194,8 +238,10 @@ class Retrieval:
                     for ident in stale_ids:c.execute('DELETE FROM vectors WHERE id=?',(ident,))
                     for ident,(digest,vectors_list) in updates.items():
                         c.execute('DELETE FROM vectors WHERE id=?',(ident,))
-                        for part,vector in enumerate(vectors_list):c.execute('INSERT INTO vectors VALUES(?,?,?,?)',(ident,part,digest,_pack_vector(vector)))
+                        for part,vector in enumerate(vectors_list):
+                            c.execute('INSERT INTO vectors VALUES(?,?,?,?)',(ident,part,digest,_encode_vector(vector,self.vector_storage)))
                     c.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('generation',generation))
+                    c.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('vector_storage',self.vector_storage))
                     vectors=list(c.execute('SELECT id,value FROM vectors'))
             else:
                 vectors=[(row_id,raw_val) for row_id,_,_,raw_val in stored_rows]

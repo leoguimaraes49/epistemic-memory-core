@@ -19,9 +19,11 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import sys
 import threading
 import urllib.parse
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -30,7 +32,7 @@ from .ui import render_gateway_html
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
+if SRC_DIR.is_dir() and str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 DEFAULT_HOST = "127.0.0.1"
@@ -99,14 +101,94 @@ def _load_shared_embedder(candidate: Path) -> _ThreadSafeEmbedder | None:
     return wrapped
 
 
-def bootstrap_gateway_workspace(workspace_dir: str | Path) -> tuple[Path, Path]:
-    """Configura `EMC_SYSTEM` e `EMC_VAULT` para processos CLI dedicados."""
+def bootstrap_gateway_workspace(workspace_dir: str | Path, *, authorize: bool = True) -> tuple[Path, Path]:
+    """Configura `EMC_SYSTEM`, `EMC_VAULT` e escopo autorizado para processos CLI dedicados."""
     ws = Path(workspace_dir).resolve()
     sys_root = ws / "sistema"
     vault_root = ws / "cofre"
     os.environ["EMC_SYSTEM"] = str(sys_root)
     os.environ["EMC_VAULT"] = str(vault_root)
+    if authorize:
+        existing = [
+            entry.strip()
+            for entry in os.environ.get("EMC_AUTHORIZED_ROOTS", "").split(os.pathsep)
+            if entry.strip()
+        ]
+        ws_str = str(ws)
+        if ws_str not in existing:
+            existing.append(ws_str)
+        os.environ["EMC_AUTHORIZED_ROOTS"] = os.pathsep.join(existing)
     return sys_root, vault_root
+
+
+def _is_authorized_gateway_scope(system_root: Path, vault_root: Path) -> bool:
+    """Valida escopo autorizado antes de qualquer gravação em disco (Finding #7)."""
+    import nucleo
+
+    checker = getattr(nucleo, "is_authorized_scope", None)
+    if callable(checker):
+        return bool(checker(system_root, vault_root))
+
+    r = Path(system_root).resolve()
+    v = Path(vault_root).resolve()
+    real_sys = Path(nucleo.REAL_SYSTEM).resolve()
+    real_vlt = Path(nucleo.REAL_VAULT).resolve()
+    temp = (real_sys / "testes_temporarios").resolve()
+    if (r == real_sys and v == real_vlt) or (temp in r.parents and temp in v.parents):
+        return True
+    for raw_entry in os.environ.get("EMC_AUTHORIZED_ROOTS", "").split(os.pathsep):
+        cleaned = raw_entry.strip()
+        if not cleaned:
+            continue
+        auth_root = Path(cleaned).resolve()
+        if (r == auth_root or auth_root in r.parents) and (v == auth_root or auth_root in v.parents):
+            return True
+    return False
+
+
+def _bootstrap_gateway_manual(system_root: Path, vault_root: Path) -> dict[str, str]:
+    """Semeadura determinística de `manual_manifest.json` e `00_Manual` via pacote ou clone (Finding #4)."""
+    from autonomia import atomic_json
+    from nucleo import REAL_SYSTEM, config_file
+
+    try:
+        import recursos_pacote  # type: ignore[import-not-found]
+    except ImportError:
+        recursos_pacote = None
+
+    if recursos_pacote is not None and callable(getattr(recursos_pacote, "bootstrap_manual_tree", None)):
+        return dict(recursos_pacote.bootstrap_manual_tree(system_root, vault_root))
+
+    manifest: dict[str, str] | None = None
+    if recursos_pacote is not None and callable(getattr(recursos_pacote, "load_manual_manifest", None)):
+        manifest = dict(recursos_pacote.load_manual_manifest())
+    else:
+        for candidate_root in (REPO_ROOT, REAL_SYSTEM, system_root):
+            manifest_src = config_file(candidate_root, "manual_manifest.json")
+            if manifest_src.is_file():
+                manifest = json.loads(manifest_src.read_text(encoding="utf-8"))
+                break
+    if manifest is None:
+        raise FileNotFoundError("manual_manifest.json não encontrado nos recursos do pacote nem no repositório.")
+
+    manual_dest = vault_root / "00_Manual"
+    manual_dest.mkdir(parents=True, exist_ok=True)
+    for name in manifest:
+        dest = manual_dest / name
+        if dest.exists():
+            continue
+        if recursos_pacote is not None and callable(getattr(recursos_pacote, "read_manual_bytes", None)):
+            dest.write_bytes(recursos_pacote.read_manual_bytes(name))
+        else:
+            for src_dir in (REPO_ROOT / "00_Manual", REAL_SYSTEM / "00_Manual"):
+                candidate = src_dir / name
+                if candidate.is_file():
+                    dest.write_bytes(candidate.read_bytes())
+                    break
+
+    if not (system_root / "manual_manifest.json").exists():
+        atomic_json(system_root / "manual_manifest.json", manifest)
+    return manifest
 
 
 def is_allowed_host(host_header: str) -> bool:
@@ -217,33 +299,44 @@ class EpistemicGatewayRuntime:
         from autonomia import atomic_json
         from conhecimento import Knowledge
         from execucao import DEFAULT
-        from nucleo import REAL_SYSTEM, Store, config_file
+        from nucleo import Invalid, Store, config_file
         from recuperacao import Retrieval
 
         self._lock = threading.RLock()
         self.scope = scope
         self.system_root = Path(system_root).resolve()
         self.vault_root = Path(vault_root).resolve()
+
+        # Finding #7: validar autorização de escopo ANTES de criar qualquer diretório ou arquivo.
+        if not _is_authorized_gateway_scope(self.system_root, self.vault_root):
+            raise Invalid("raiz fora do escopo autorizado")
+
         self.system_root.mkdir(parents=True, exist_ok=True)
         self.vault_root.mkdir(parents=True, exist_ok=True)
         for folder in VAULT_FOLDERS:
             (self.vault_root / folder).mkdir(parents=True, exist_ok=True)
 
-        manifest_src = config_file(REPO_ROOT, "manual_manifest.json")
-        if not manifest_src.exists():
-            manifest_src = config_file(REAL_SYSTEM, "manual_manifest.json")
-        manifest = json.loads(manifest_src.read_text(encoding="utf-8"))
-        manual_src_dir = REPO_ROOT / "00_Manual"
-        for name in manifest:
-            dest = self.vault_root / "00_Manual" / name
-            if not dest.exists() and (manual_src_dir / name).is_file():
-                dest.write_bytes((manual_src_dir / name).read_bytes())
-
-        if not (self.system_root / "manual_manifest.json").exists():
-            atomic_json(self.system_root / "manual_manifest.json", manifest)
+        _bootstrap_gateway_manual(self.system_root, self.vault_root)
 
         self.store = Store(self.system_root, self.vault_root)
         self.knowledge = Knowledge(self.store)
+
+        self.ops_db = self.system_root / "estado" / "gateway_operacoes.sqlite3"
+        with self._connect_ops() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operation_receipts (
+                    endpoint_kind TEXT NOT NULL,
+                    operation_key TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    PRIMARY KEY (endpoint_kind, operation_key)
+                )
+                """
+            )
 
         self.embeddings_requested = bool(enable_embeddings)
         emb_env = os.environ.get("EMC_EMBEDDINGS_DIR")
@@ -256,10 +349,11 @@ class EpistemicGatewayRuntime:
         if not cfg_path.exists():
             cfg = copy.deepcopy(DEFAULT)
             cfg["enabled"] = True
-            cfg["embeddings"] = {
-                "enabled": self.embedder is not None,
-                "folder": self.embeddings_candidate_dir.as_posix(),
-            }
+            emb_cfg = dict(cfg.get("embeddings") or {})
+            emb_cfg["enabled"] = self.embedder is not None
+            emb_cfg["folder"] = self.embeddings_candidate_dir.as_posix()
+            emb_cfg.setdefault("vector_storage", "packed_f64")
+            cfg["embeddings"] = emb_cfg
             atomic_json(self.system_root / "execucao.json", cfg)
 
         self.retrieval = Retrieval(self.store, embedder=self.embedder, scope=self.scope)
@@ -274,6 +368,51 @@ class EpistemicGatewayRuntime:
     ) -> "EpistemicGatewayRuntime":
         ws = Path(workspace_dir).resolve()
         return cls(ws / "sistema", ws / "cofre", enable_embeddings=enable_embeddings, scope=scope)
+
+    @contextmanager
+    def _connect_ops(self):
+        conn = sqlite3.connect(self.ops_db, timeout=15)
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA secure_delete=ON")
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def _load_op_receipt(
+        self, endpoint_kind: str, operation_key: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        with self._connect_ops() as conn:
+            row = conn.execute(
+                "SELECT fingerprint, receipt_json FROM operation_receipts WHERE endpoint_kind=? AND operation_key=?",
+                (endpoint_kind, operation_key),
+            ).fetchone()
+        if not row:
+            return None
+        return row[0], json.loads(row[1])
+
+    def _save_op_receipt(
+        self,
+        endpoint_kind: str,
+        operation_key: str,
+        fingerprint: str,
+        record_id: str,
+        revision: int,
+        receipt: dict[str, Any],
+    ) -> None:
+        from nucleo import NOW
+
+        serialized = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with self._connect_ops() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO operation_receipts(
+                    endpoint_kind, operation_key, fingerprint, record_id, revision, confirmed_at, receipt_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (endpoint_kind, operation_key, fingerprint, record_id, revision, NOW(), serialized),
+            )
 
     def _check_access_gate(self) -> None:
         from nucleo import REAL_SYSTEM
@@ -335,6 +474,231 @@ class EpistemicGatewayRuntime:
             return "superseded"
         return "active"
 
+    def _read_source_revision_snapshot(self, record_id: str, rev: int) -> dict[str, Any]:
+        """Recupera bytes brutos, SHA-256 exato e conteúdo da revisão `rev` em `30_Fontes` ou `estado/revisoes`."""
+        from nucleo import Conflict, Invalid, parse, read_exclusive, sha
+
+        with self.store.connect() as conn:
+            if conn.execute("SELECT 1 FROM tombstones WHERE record_id=?", (record_id,)).fetchone():
+                raise Invalid("registro excluído ou em exclusão")
+            row = conn.execute("SELECT filename, revision, digest FROM records WHERE id=?", (record_id,)).fetchone()
+        if not row:
+            raise Invalid("registro não encontrado")
+        fname, current_rev, current_digest = row
+        active_bytes = read_exclusive(self.store.safe_path(fname))
+        if sha(active_bytes) != current_digest:
+            with self.store.connect() as conn:
+                if conn.execute("SELECT 1 FROM tombstones WHERE record_id=?", (record_id,)).fetchone():
+                    raise Invalid("registro excluído ou em exclusão")
+                fresh = conn.execute("SELECT filename, revision, digest FROM records WHERE id=?", (record_id,)).fetchone()
+            if not fresh or fresh[0] != fname or sha(active_bytes) != fresh[2]:
+                raise Conflict("edição externa detectada; reconciliação necessária")
+            current_rev, current_digest = fresh[1], fresh[2]
+
+        active_parsed = parse(active_bytes)
+        if active_parsed.get("id") != record_id or active_parsed.get("revision") != current_rev:
+            raise Conflict("identidade ou revisão divergente")
+
+        if type(rev) is not int or rev < 1 or rev > current_rev:
+            raise Invalid(f"revisão {rev} fora do intervalo válido (1..{current_rev})")
+
+        if rev == current_rev:
+            raw_bytes = active_bytes
+            parsed = active_parsed
+        else:
+            hist_root = (self.system_root / "estado" / "revisoes").resolve()
+            hist_dir = hist_root / record_id
+            if hist_dir.is_symlink() or hist_dir.resolve().parent != hist_root:
+                raise Invalid("histórico de revisões redirecionado")
+            hist_file = hist_dir / f"{rev}.md"
+            if hist_file.is_symlink() or hist_file.resolve().parent != hist_dir.resolve() or not hist_file.is_file():
+                raise Conflict(f"snapshot histórico da revisão {rev} indisponível para {record_id}")
+            raw_bytes = hist_file.read_bytes()
+            parsed = parse(raw_bytes)
+            if parsed.get("id") != record_id or parsed.get("revision") != rev:
+                raise Conflict("identidade ou revisão divergente no snapshot histórico")
+
+        return {
+            "record_id": record_id,
+            "revision": rev,
+            "sha256": sha(raw_bytes),
+            "raw_bytes": raw_bytes,
+            "record": parsed,
+            "folder": "30_Fontes",
+            "episteme_class": "30_Fontes",
+            "current_revision": current_rev,
+            "current_sha256": current_digest,
+        }
+
+    def _read_knowledge_revision_snapshot(self, record_id: str, rev: int) -> dict[str, Any]:
+        """Recupera bytes brutos, SHA-256 exato e payload da revisão `rev` em `managed` ou `conhecimento_revisoes`."""
+        from conhecimento import decode
+        from nucleo import Conflict, Invalid, read_exclusive, sha
+
+        with self.knowledge.connect() as conn:
+            row = conn.execute("SELECT path, digest, revision FROM managed WHERE id=?", (record_id,)).fetchone()
+        if row:
+            rel_posix = str(row[0]).replace("\\", "/")
+            folder = PurePosixPath(rel_posix).parent.as_posix()
+            active_path = (self.vault_root / rel_posix).resolve()
+            if active_path.is_symlink() or not active_path.is_relative_to(self.vault_root) or not active_path.is_file():
+                raise Conflict("arquivo controlado de conhecimento ausente ou redirecionado")
+            active_bytes = read_exclusive(active_path)
+            current_sha = sha(active_bytes)
+            if current_sha != row[1]:
+                raise Conflict("edição externa de conhecimento detectada")
+            active_parsed = decode(active_bytes)
+            current_rev = active_parsed["revision"]
+        else:
+            records, paths, _ = self.knowledge.catalog()
+            if record_id not in records or record_id not in paths:
+                raise Invalid("registro não encontrado")
+            active_path = paths[record_id]
+            rel_posix = active_path.relative_to(self.vault_root).as_posix()
+            folder = PurePosixPath(rel_posix).parent.as_posix()
+            active_bytes = read_exclusive(active_path)
+            current_sha = sha(active_bytes)
+            active_parsed = decode(active_bytes)
+            current_rev = active_parsed["revision"]
+
+        if active_parsed.get("id") != record_id or active_parsed.get("revision") != current_rev:
+            raise Conflict("identidade ou revisão divergente no conhecimento ativo")
+
+        if type(rev) is not int or rev < 1 or rev > current_rev:
+            raise Invalid(f"revisão {rev} fora do intervalo válido (1..{current_rev})")
+
+        if rev == current_rev:
+            raw_bytes = active_bytes
+            parsed = active_parsed
+        else:
+            hist_root = (self.system_root / "estado" / "conhecimento_revisoes").resolve()
+            hist_dir = hist_root / record_id
+            if hist_dir.is_symlink() or hist_dir.resolve().parent != hist_root:
+                raise Invalid("histórico de conhecimento redirecionado")
+            hist_file = hist_dir / f"{rev}.md"
+            if hist_file.is_symlink() or hist_file.resolve().parent != hist_dir.resolve() or not hist_file.is_file():
+                raise Conflict(f"snapshot histórico de conhecimento v{rev} indisponível para {record_id}")
+            raw_bytes = hist_file.read_bytes()
+            parsed = decode(raw_bytes)
+            if parsed.get("id") != record_id or parsed.get("revision") != rev:
+                raise Conflict("identidade ou revisão divergente no snapshot de conhecimento")
+
+        return {
+            "record_id": record_id,
+            "revision": rev,
+            "sha256": sha(raw_bytes),
+            "raw_bytes": raw_bytes,
+            "record": parsed,
+            "folder": folder,
+            "episteme_class": folder.split("/")[0],
+            "current_revision": current_rev,
+            "current_sha256": current_sha,
+        }
+
+    def _diff_between_revisions(self, ident: str, rtype: str, old_rev: int, new_rev: int) -> list[str]:
+        """Calcula diff exato `old_rev -> new_rev` lendo ambos os snapshots históricos/ativos."""
+        try:
+            if rtype == "source":
+                old_snap = self._read_source_revision_snapshot(ident, old_rev)
+                new_snap = self._read_source_revision_snapshot(ident, new_rev)
+                old_lines = str(old_snap["record"].get("payload", {}).get("content", "")).splitlines()
+                new_lines = str(new_snap["record"].get("payload", {}).get("content", "")).splitlines()
+            else:
+                old_snap = self._read_knowledge_revision_snapshot(ident, old_rev)
+                new_snap = self._read_knowledge_revision_snapshot(ident, new_rev)
+                old_lines = json.dumps(
+                    old_snap["record"].get("payload", {}), ensure_ascii=False, indent=2, sort_keys=True
+                ).splitlines()
+                new_lines = json.dumps(
+                    new_snap["record"].get("payload", {}), ensure_ascii=False, indent=2, sort_keys=True
+                ).splitlines()
+        except Exception:
+            return []
+        return list(
+            difflib.unified_diff(
+                old_lines,
+                new_lines,
+                fromfile=f"revisao_{old_rev}",
+                tofile=f"revisao_{new_rev}",
+                lineterm="",
+            )
+        )
+
+    def _records_pinned_to_revision(
+        self, records: dict[str, dict[str, Any]], target_id: str, pinned_rev: int
+    ) -> list[str]:
+        """Reconstrói deterministicamente derivados direta ou transitivamente pinados em `(target_id, pinned_rev)`."""
+        from conhecimento import decode, refs
+
+        snapshots_by_id: dict[str, list[dict[str, Any]]] = {}
+        hist_root = self.system_root / "estado" / "conhecimento_revisoes"
+        for ident, rec in records.items():
+            if rec.get("record_type") == "source":
+                continue
+            snaps = [rec]
+            rec_hist_dir = hist_root / ident
+            if rec_hist_dir.is_dir() and not rec_hist_dir.is_symlink():
+                for hp in sorted(rec_hist_dir.glob("*.md"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0):
+                    if hp.stem.isdigit() and not hp.is_symlink():
+                        try:
+                            snaps.append(decode(hp.read_bytes()))
+                        except Exception:
+                            pass
+            snapshots_by_id[ident] = snaps
+
+        impacted: set[str] = set()
+        for ident, snaps in snapshots_by_id.items():
+            for snap_rec in snaps:
+                for ref in refs(snap_rec.get("payload", {})):
+                    if snap_rec.get("record_type") == "question" and ref in snap_rec.get("payload", {}).get("trigger_refs", []):
+                        continue
+                    if ref.get("record_id") == target_id and ref.get("revision") == pinned_rev:
+                        impacted.add(ident)
+                        break
+
+        for _ in range(len(snapshots_by_id)):
+            extra = {
+                ident
+                for ident, snaps in snapshots_by_id.items()
+                if any(
+                    r.get("record_id") in impacted
+                    and not (snap_rec.get("record_type") == "question" and r in snap_rec.get("payload", {}).get("trigger_refs", []))
+                    for snap_rec in snaps
+                    for r in refs(snap_rec.get("payload", {}))
+                )
+            }
+            if extra <= impacted:
+                break
+            impacted |= extra
+        return sorted(impacted)
+
+    def _build_current_state(
+        self,
+        record_id: str,
+        *,
+        catalog_tuple: tuple[dict[str, dict[str, Any]], dict[str, Path], list[dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
+        """Calcula o estado vivo no momento da consulta, estritamente separado do comprovante histórico."""
+        records, paths, _ = catalog_tuple if catalog_tuple is not None else self.knowledge.catalog()
+        stale_ids = self.knowledge.stale(records)
+        digests, _, _ = self._catalog_metadata(records, paths)
+        rec = records.get(record_id)
+        cur_rev = rec["revision"] if rec is not None else None
+        cur_sha = digests.get(record_id)
+        cur_status = self._record_status(record_id, rec, stale_ids) if rec is not None else "missing"
+        receipts = self._reverify_all_receipts()
+        stale_rc_ids = [r["receipt_id"] for r in receipts if r.get("status") == "stale"]
+        return {
+            "record_id": record_id,
+            "current_revision": cur_rev,
+            "current_sha256": cur_sha,
+            "total_revisions": cur_rev,
+            "current_status": cur_status,
+            "currently_suspended_ids": sorted(stale_ids),
+            "total_currently_suspended_records": len(stale_ids),
+            "currently_stale_receipt_ids": stale_rc_ids,
+        }
+
     def _archived_revisions_for(
         self,
         ident: str,
@@ -385,36 +749,7 @@ class EpistemicGatewayRuntime:
         return entries
 
     def _revision_diff(self, ident: str, rec: dict[str, Any], old_rev: int, new_rev: int) -> list[str]:
-        from conhecimento import decode
-        from nucleo import parse
-
-        rtype = rec["record_type"]
-        hist_file = (
-            self.system_root / "estado" / "revisoes" / ident / f"{old_rev}.md"
-            if rtype == "source"
-            else self.system_root / "estado" / "conhecimento_revisoes" / ident / f"{old_rev}.md"
-        )
-        if not hist_file.is_file() or hist_file.is_symlink():
-            return []
-        try:
-            old_parsed = parse(hist_file.read_bytes()) if rtype == "source" else decode(hist_file.read_bytes())
-        except Exception:
-            return []
-        if rtype == "source":
-            old_lines = str(old_parsed.get("payload", {}).get("content", "")).splitlines()
-            new_lines = str(rec.get("payload", {}).get("content", "")).splitlines()
-        else:
-            old_lines = json.dumps(old_parsed.get("payload", {}), ensure_ascii=False, indent=2, sort_keys=True).splitlines()
-            new_lines = json.dumps(rec.get("payload", {}), ensure_ascii=False, indent=2, sort_keys=True).splitlines()
-        return list(
-            difflib.unified_diff(
-                old_lines,
-                new_lines,
-                fromfile=f"revisao_{old_rev}",
-                tofile=f"revisao_{new_rev}",
-                lineterm="",
-            )
-        )
+        return self._diff_between_revisions(ident, rec["record_type"], old_rev, new_rev)
 
     def _reverify_all_receipts(self) -> list[dict[str, Any]]:
         from evidencias import read_json, read_receipt
@@ -885,8 +1220,8 @@ class EpistemicGatewayRuntime:
             }
 
     def create_source(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Registra fonte primária em `30_Fontes` com validação canônica e hash SHA-256."""
-        from nucleo import Invalid
+        """Registra fonte primária em `30_Fontes` com comprovante histórico imutável por `operation_key`."""
+        from nucleo import Conflict, Invalid, canon, sha
 
         with self._lock:
             self._check_access_gate()
@@ -933,29 +1268,55 @@ class EpistemicGatewayRuntime:
             else:
                 metadata = None
 
-            res = self.store.apply(op_key, "create", title=title, text=content, source_metadata=metadata)
+            prior_saved = self._load_op_receipt("sources_create", op_key)
             with self.store.connect() as conn:
-                row = conn.execute("SELECT digest FROM records WHERE id=?", (res["id"],)).fetchone()
-            file_sha = row[0] if row else None
+                prior_store = conn.execute("SELECT status FROM operations WHERE key=?", (op_key,)).fetchone()
+            was_confirmed = (prior_saved is not None) or bool(prior_store and prior_store[0] == "confirmed")
+
+            res = self.store.apply(op_key, "create", title=title, text=content, source_metadata=metadata)
+            record_id = res["id"]
+            rev = res["revision"]
+            snap = self._read_source_revision_snapshot(record_id, rev)
+            req_fp = sha(canon({"kind": "create", "title": title, "text": content, "source_metadata": metadata}).encode())
+
+            if prior_saved is not None:
+                saved_fp, historical_receipt = prior_saved
+                if saved_fp != req_fp:
+                    raise Conflict("chave reutilizada para outro pedido")
+                if historical_receipt.get("sha256") != snap["sha256"]:
+                    raise Conflict("histórico divergente do comprovante da operação")
+            else:
+                historical_receipt = {
+                    "status": "ok",
+                    "operation_key": op_key,
+                    "revision": rev,
+                    "sha256": snap["sha256"],
+                    "revision_count_at_operation": rev,
+                    "record": {
+                        "id": record_id,
+                        "revision": rev,
+                        "title": snap["record"]["title"],
+                        "record_type": "source",
+                        "episteme_class": "30_Fontes",
+                        "folder": "30_Fontes",
+                        "status": "active",
+                        "sha256": snap["sha256"],
+                        "created_at": snap["record"].get("created_at"),
+                        "updated_at": snap["record"].get("updated_at"),
+                    },
+                    "rev_ref": {"record_id": record_id, "revision": rev},
+                }
+                self._save_op_receipt("sources_create", op_key, req_fp, record_id, rev, historical_receipt)
+
             return {
-                "status": "ok",
-                "operation_key": op_key,
-                "record": {
-                    "id": res["id"],
-                    "revision": res["revision"],
-                    "title": title.strip(),
-                    "record_type": "source",
-                    "episteme_class": "30_Fontes",
-                    "folder": "30_Fontes",
-                    "status": "active",
-                    "sha256": file_sha,
-                },
-                "rev_ref": {"record_id": res["id"], "revision": res["revision"]},
+                **copy.deepcopy(historical_receipt),
+                "replayed": was_confirmed,
+                "current_state": self._build_current_state(record_id),
             }
 
     def rectify_source(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Retifica fonte em `30_Fontes`, arquiva revisão anterior e calcula o raio de impacto."""
-        from nucleo import Invalid
+        """Retifica fonte em `30_Fontes`, arquiva revisão anterior e persiste o recibo histórico da operação."""
+        from nucleo import Conflict, Invalid, canon, sha
 
         with self._lock:
             self._check_access_gate()
@@ -979,8 +1340,16 @@ class EpistemicGatewayRuntime:
             if not isinstance(reason, str):
                 raise Invalid("campo 'reason' (motivo formal da retificação) é obrigatório")
 
-            before_records, _, _ = self.knowledge.catalog()
-            before_stale = self.knowledge.stale(before_records)
+            prior_saved = self._load_op_receipt("sources_rectify", op_key)
+            with self.store.connect() as conn:
+                prior_store = conn.execute("SELECT status FROM operations WHERE key=?", (op_key,)).fetchone()
+            was_confirmed = (prior_saved is not None) or bool(prior_store and prior_store[0] == "confirmed")
+
+            if not was_confirmed:
+                before_records, _, _ = self.knowledge.catalog()
+                before_stale = self.knowledge.stale(before_records)
+            else:
+                before_stale = set()
 
             updated = self.store.apply(
                 op_key,
@@ -992,46 +1361,97 @@ class EpistemicGatewayRuntime:
                 source_metadata=source_metadata,
             )
 
-            after_records, after_paths, _ = self.knowledge.catalog()
-            after_stale = self.knowledge.stale(after_records)
-            digests, folders, classes = self._catalog_metadata(after_records, after_paths)
+            to_rev = updated["revision"]
+            old_snap = self._read_source_revision_snapshot(record_id, expected_rev)
+            new_snap = self._read_source_revision_snapshot(record_id, to_rev)
+            req_fp = sha(
+                canon(
+                    {
+                        "kind": "correct",
+                        "id": record_id,
+                        "expected": expected_rev,
+                        "text": new_content,
+                        "reason": reason,
+                        "source_metadata": source_metadata,
+                    }
+                ).encode()
+            )
 
-            newly_suspended = sorted(after_stale - before_stale)
-            all_suspended = sorted(after_stale)
-            receipts = self._reverify_all_receipts()
-            stale_receipts = [r["receipt_id"] for r in receipts if r.get("status") == "stale"]
-            diff_lines = self._revision_diff(record_id, after_records[record_id], expected_rev, updated["revision"])
+            after_tuple = None
+            if prior_saved is not None:
+                saved_fp, historical_receipt = prior_saved
+                if saved_fp != req_fp:
+                    raise Conflict("chave reutilizada para outro pedido")
+                if (
+                    historical_receipt.get("old_sha256") != old_snap["sha256"]
+                    or historical_receipt.get("new_sha256") != new_snap["sha256"]
+                ):
+                    raise Conflict("histórico divergente do comprovante da retificação")
+            else:
+                after_tuple = self.knowledge.catalog()
+                after_records, after_paths, _ = after_tuple
+                after_stale = self.knowledge.stale(after_records)
+                _, folders, classes = self._catalog_metadata(after_records, after_paths)
+                diff_lines = self._diff_between_revisions(record_id, "source", expected_rev, to_rev)
+
+                if not was_confirmed:
+                    newly_suspended = sorted(after_stale - before_stale)
+                    all_suspended = sorted(after_stale)
+                    receipts = self._reverify_all_receipts()
+                    stale_receipts = [r["receipt_id"] for r in receipts if r.get("status") == "stale"]
+                else:
+                    newly_suspended = self._records_pinned_to_revision(after_records, record_id, expected_rev)
+                    all_suspended = list(newly_suspended)
+                    receipts = self._reverify_all_receipts()
+                    stale_receipts = [
+                        r["receipt_id"]
+                        for r in receipts
+                        if r.get("status") == "stale" and record_id in (r.get("referenced_record_ids") or [])
+                    ]
+
+                historical_receipt = {
+                    "status": "ok",
+                    "operation_key": op_key,
+                    "from_revision": expected_rev,
+                    "to_revision": to_rev,
+                    "revision": to_rev,
+                    "old_sha256": old_snap["sha256"],
+                    "new_sha256": new_snap["sha256"],
+                    "sha256": new_snap["sha256"],
+                    "revision_count_at_operation": to_rev,
+                    "update": updated,
+                    "rev_ref": {"record_id": record_id, "revision": to_rev},
+                    "newly_suspended_ids": newly_suspended,
+                    "newly_suspended_records": [
+                        {
+                            "id": rid,
+                            "title": after_records[rid]["title"],
+                            "record_type": after_records[rid]["record_type"],
+                            "episteme_class": classes[rid],
+                            "folder": folders[rid],
+                            "revision": after_records[rid]["revision"],
+                            "status": "suspended",
+                        }
+                        for rid in newly_suspended
+                        if rid in after_records
+                    ],
+                    "suspended_ids": all_suspended,
+                    "total_suspended_records": len(all_suspended),
+                    "stale_receipt_ids": stale_receipts,
+                    "diff": diff_lines,
+                }
+                self._save_op_receipt("sources_rectify", op_key, req_fp, record_id, to_rev, historical_receipt)
 
             return {
-                "status": "ok",
-                "operation_key": op_key,
-                "update": updated,
-                "rev_ref": {"record_id": record_id, "revision": updated["revision"]},
-                "sha256": digests.get(record_id),
-                "newly_suspended_ids": newly_suspended,
-                "newly_suspended_records": [
-                    {
-                        "id": rid,
-                        "title": after_records[rid]["title"],
-                        "record_type": after_records[rid]["record_type"],
-                        "episteme_class": classes[rid],
-                        "folder": folders[rid],
-                        "revision": after_records[rid]["revision"],
-                        "status": "suspended",
-                    }
-                    for rid in newly_suspended
-                    if rid in after_records
-                ],
-                "suspended_ids": all_suspended,
-                "total_suspended_records": len(after_stale),
-                "stale_receipt_ids": stale_receipts,
-                "diff": diff_lines,
+                **copy.deepcopy(historical_receipt),
+                "replayed": was_confirmed,
+                "current_state": self._build_current_state(record_id, catalog_tuple=after_tuple),
             }
 
     def create_or_update_knowledge(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Registra ou atualiza conhecimento derivado aplicando `atribuicao.py` e `esquemas.py`."""
+        """Registra ou atualiza conhecimento derivado com comprovante histórico por `operation_key`."""
         from conhecimento import FOLDERS, decode
-        from nucleo import Invalid, NOW, read_exclusive
+        from nucleo import Conflict, Invalid, NOW, canon, read_exclusive, sha
 
         with self._lock:
             self._check_access_gate()
@@ -1040,6 +1460,7 @@ class EpistemicGatewayRuntime:
 
             op_key = str(data.get("operation_key") or data.get("key") or ("gw-knw-" + secrets.token_hex(8)))
             action = data.get("action")
+            prior_saved = self._load_op_receipt("knowledge_write", op_key)
 
             if action == "finish_assessment":
                 from avaliacoes import finish
@@ -1047,24 +1468,43 @@ class EpistemicGatewayRuntime:
                 assessment_id = data.get("assessment_id")
                 if not isinstance(assessment_id, str) or not assessment_id.strip():
                     raise Invalid("campo 'assessment_id' é obrigatório para finish_assessment")
+                req_fp = sha(canon({"action": "finish_assessment", "assessment_id": assessment_id}).encode())
+                if prior_saved is not None and prior_saved[0] != req_fp:
+                    raise Conflict("chave reutilizada para outro pedido")
+
+                was_confirmed = prior_saved is not None
                 res = finish(self.store, op_key, assessment_id)
-                records, paths, _ = self.knowledge.catalog()
-                digests, folders, classes = self._catalog_metadata(records, paths)
                 rid = res["id"]
+                rev = res["revision"]
+                snap = self._read_knowledge_revision_snapshot(rid, rev)
+                if prior_saved is not None:
+                    historical_receipt = prior_saved[1]
+                    if historical_receipt.get("sha256") != snap["sha256"]:
+                        raise Conflict("histórico divergente do comprovante de avaliação")
+                else:
+                    historical_receipt = {
+                        "status": "ok",
+                        "operation_key": op_key,
+                        "revision": rev,
+                        "sha256": snap["sha256"],
+                        "revision_count_at_operation": rev,
+                        "record": {
+                            "id": rid,
+                            "revision": rev,
+                            "title": snap["record"]["title"],
+                            "record_type": snap["record"]["record_type"],
+                            "episteme_class": snap["episteme_class"],
+                            "folder": snap["folder"],
+                            "status": "active",
+                            "sha256": snap["sha256"],
+                        },
+                        "rev_ref": {"record_id": rid, "revision": rev},
+                    }
+                    self._save_op_receipt("knowledge_write", op_key, req_fp, rid, rev, historical_receipt)
                 return {
-                    "status": "ok",
-                    "operation_key": op_key,
-                    "record": {
-                        "id": rid,
-                        "revision": res["revision"],
-                        "title": records[rid]["title"],
-                        "record_type": records[rid]["record_type"],
-                        "episteme_class": classes[rid],
-                        "folder": folders[rid],
-                        "status": "active",
-                        "sha256": digests[rid],
-                    },
-                    "rev_ref": {"record_id": rid, "revision": res["revision"]},
+                    **copy.deepcopy(historical_receipt),
+                    "replayed": was_confirmed,
+                    "current_state": self._build_current_state(rid),
                 }
 
             if action == "human_review":
@@ -1085,26 +1525,69 @@ class EpistemicGatewayRuntime:
                     or not isinstance(review_scope, str)
                 ):
                     raise Invalid("campos obrigatórios ausentes para human_review")
+                req_fp = sha(
+                    canon(
+                        {
+                            "action": "human_review",
+                            "assertion_id": assertion_id,
+                            "expected_revision": expected_rev,
+                            "review_status": review_status,
+                            "source_ref": source_ref,
+                            "quote": quote,
+                            "scope": review_scope,
+                        }
+                    ).encode()
+                )
+                if prior_saved is not None and prior_saved[0] != req_fp:
+                    raise Conflict("chave reutilizada para outro pedido")
+
+                internal_op = sha(
+                    canon([op_key, assertion_id, expected_rev, review_status, source_ref, quote, review_scope]).encode()
+                )
+                with self.knowledge.connect() as conn:
+                    prior_knw = conn.execute("SELECT status FROM operations WHERE key=?", (internal_op,)).fetchone()
+                was_confirmed = (prior_saved is not None) or bool(prior_knw and prior_knw[0] == "confirmed")
+
                 res = register_review(
                     self.store, op_key, assertion_id, expected_rev, review_status, source_ref, quote, review_scope
                 )
-                records, paths, _ = self.knowledge.catalog()
-                digests, folders, classes = self._catalog_metadata(records, paths)
                 rid = res["id"]
+                rev = res["revision"]
+                old_snap = self._read_knowledge_revision_snapshot(rid, expected_rev)
+                new_snap = self._read_knowledge_revision_snapshot(rid, rev)
+                if prior_saved is not None:
+                    historical_receipt = prior_saved[1]
+                    if historical_receipt.get("sha256") != new_snap["sha256"]:
+                        raise Conflict("histórico divergente do comprovante de revisão")
+                else:
+                    historical_receipt = {
+                        "status": "ok",
+                        "operation_key": op_key,
+                        "from_revision": expected_rev,
+                        "to_revision": rev,
+                        "revision": rev,
+                        "old_sha256": old_snap["sha256"],
+                        "new_sha256": new_snap["sha256"],
+                        "sha256": new_snap["sha256"],
+                        "revision_count_at_operation": rev,
+                        "diff": self._diff_between_revisions(rid, "assertion", expected_rev, rev),
+                        "record": {
+                            "id": rid,
+                            "revision": rev,
+                            "title": new_snap["record"]["title"],
+                            "record_type": "assertion",
+                            "episteme_class": new_snap["episteme_class"],
+                            "folder": new_snap["folder"],
+                            "status": "active",
+                            "sha256": new_snap["sha256"],
+                        },
+                        "rev_ref": {"record_id": rid, "revision": rev},
+                    }
+                    self._save_op_receipt("knowledge_write", op_key, req_fp, rid, rev, historical_receipt)
                 return {
-                    "status": "ok",
-                    "operation_key": op_key,
-                    "record": {
-                        "id": rid,
-                        "revision": res["revision"],
-                        "title": records[rid]["title"],
-                        "record_type": "assertion",
-                        "episteme_class": classes[rid],
-                        "folder": folders[rid],
-                        "status": "active",
-                        "sha256": digests[rid],
-                    },
-                    "rev_ref": {"record_id": rid, "revision": res["revision"]},
+                    **copy.deepcopy(historical_receipt),
+                    "replayed": was_confirmed,
+                    "current_state": self._build_current_state(rid),
                 }
 
             kind = data.get("record_type") or data.get("kind")
@@ -1123,25 +1606,31 @@ class EpistemicGatewayRuntime:
             if expected is not None and type(expected) is not int:
                 raise Invalid("campo 'expected_revision' deve ser inteiro")
 
+            with self.knowledge.connect() as conn:
+                prior = conn.execute(
+                    "SELECT status, path, data, result FROM operations WHERE key=?", (op_key,)
+                ).fetchone()
+            prior_status = prior[0] if prior else None
+            was_confirmed = (prior_saved is not None) or (prior_status == "confirmed")
+
             if kind == "assertion":
                 from atribuicao import AttributionError, owner_id, persons, validate_assertion
 
                 payload.setdefault("valid_time", {"precision": "unknown"})
                 payload.setdefault("review_status", "unreviewed")
                 payload.setdefault("context_description", "Registrado via Epistemic HTTP Gateway")
-                prior_status = None
-                with self.knowledge.connect() as conn:
-                    prior = conn.execute(
-                        "SELECT status, path, data FROM operations WHERE key=?", (op_key,)
-                    ).fetchone()
-                if prior:
-                    prior_status = prior[0]
                 if "recorded_time" not in payload:
                     prior_ts = None
                     if prior:
                         try:
                             if prior[2] is not None:
                                 prior_ts = decode(prior[2])["payload"].get("recorded_time")
+                            elif prior[3]:
+                                parsed_res = json.loads(prior[3])
+                                prior_snap = self._read_knowledge_revision_snapshot(
+                                    parsed_res["id"], parsed_res["revision"]
+                                )
+                                prior_ts = prior_snap["record"]["payload"].get("recorded_time")
                             elif prior[1]:
                                 disk_file = self.vault_root / str(prior[1]).replace("\\", "/")
                                 if disk_file.is_file():
@@ -1186,24 +1675,58 @@ class EpistemicGatewayRuntime:
                 expected=expected,
                 review_authorized=False,
             )
-            records, paths, _ = self.knowledge.catalog()
-            digests, folders, classes = self._catalog_metadata(records, paths)
             rid = res["id"]
-            stale_ids = self.knowledge.stale(records)
+            rev = res["revision"]
+            snap = self._read_knowledge_revision_snapshot(rid, rev)
+            req_fp = sha(
+                canon({"kind": kind, "title": title, "payload": payload, "id": ident, "expected": expected}).encode()
+            )
+
+            after_tuple = None
+            if prior_saved is not None:
+                saved_fp, historical_receipt = prior_saved
+                if saved_fp != req_fp:
+                    raise Conflict("chave reutilizada para outro pedido")
+                if historical_receipt.get("sha256") != snap["sha256"]:
+                    raise Conflict("histórico divergente do comprovante de conhecimento")
+            else:
+                after_tuple = self.knowledge.catalog()
+                records, _, _ = after_tuple
+                stale_ids = self.knowledge.stale(records)
+                hist_status = (
+                    self._record_status(rid, snap["record"], stale_ids if not was_confirmed else set())
+                )
+                historical_receipt = {
+                    "status": "ok",
+                    "operation_key": op_key,
+                    "revision": rev,
+                    "sha256": snap["sha256"],
+                    "revision_count_at_operation": rev,
+                    "record": {
+                        "id": rid,
+                        "revision": rev,
+                        "title": snap["record"]["title"],
+                        "record_type": kind,
+                        "episteme_class": snap["episteme_class"],
+                        "folder": snap["folder"],
+                        "status": hist_status,
+                        "sha256": snap["sha256"],
+                    },
+                    "rev_ref": {"record_id": rid, "revision": rev},
+                }
+                if rev > 1:
+                    old_snap = self._read_knowledge_revision_snapshot(rid, rev - 1)
+                    historical_receipt["from_revision"] = rev - 1
+                    historical_receipt["to_revision"] = rev
+                    historical_receipt["old_sha256"] = old_snap["sha256"]
+                    historical_receipt["new_sha256"] = snap["sha256"]
+                    historical_receipt["diff"] = self._diff_between_revisions(rid, kind, rev - 1, rev)
+                self._save_op_receipt("knowledge_write", op_key, req_fp, rid, rev, historical_receipt)
+
             return {
-                "status": "ok",
-                "operation_key": op_key,
-                "record": {
-                    "id": rid,
-                    "revision": res["revision"],
-                    "title": records[rid]["title"],
-                    "record_type": kind,
-                    "episteme_class": classes[rid],
-                    "folder": folders[rid],
-                    "status": self._record_status(rid, records[rid], stale_ids),
-                    "sha256": digests[rid],
-                },
-                "rev_ref": {"record_id": rid, "revision": res["revision"]},
+                **copy.deepcopy(historical_receipt),
+                "replayed": was_confirmed,
+                "current_state": self._build_current_state(rid, catalog_tuple=after_tuple),
             }
 
     def verify_claims(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -1269,7 +1792,130 @@ class EpistemicGatewayRuntime:
                     enriched["receipt_sha256"] = saved.get("packet", {}).get("receipt_sha256")
             return enriched
 
-    def search(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _search_read_only(
+        self,
+        query: str,
+        *,
+        limit: int = 12,
+        depth: int = 1,
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Path]]:
+        """Executa busca híbrida estritamente sem efeitos colaterais em SQLite ou no cofre."""
+        from conhecimento import norm, refs
+        from nucleo import Invalid, canon, sha
+        from recuperacao import _score_vectors
+
+        if (
+            not isinstance(query, str)
+            or not query.strip()
+            or len(query) > 500
+            or type(limit) is not int
+            or not 1 <= limit <= 50
+            or type(depth) is not int
+            or not 0 <= depth <= 2
+        ):
+            raise Invalid("consulta fora dos limites")
+
+        records, paths, issues = self.knowledge.catalog()
+        invalid = self.knowledge.stale(records)
+        generation = sha(canon({"records": records, "issues": issues, "scope": self.scope}).encode())
+        cache_key = sha(
+            canon([query, limit, depth, self.scope, bool(self.embedder), "rrf-v3-lexical-ranked-context-reserved"]).encode()
+        )
+
+        stored_vectors: list[tuple[str, Any]] = []
+        if self.retrieval.db.is_file():
+            try:
+                ro_conn = sqlite3.connect(f"file:{self.retrieval.db.as_posix()}?mode=ro", uri=True, timeout=15)
+                try:
+                    cached = ro_conn.execute(
+                        "SELECT generation, result FROM cache WHERE key=?", (cache_key,)
+                    ).fetchone()
+                    if cached and cached[0] == generation:
+                        parsed_cached = json.loads(cached[1])
+                        parsed_cached["cache_reused"] = True
+                        return parsed_cached, records, paths
+                    if self.embedder is not None:
+                        stored_vectors = [
+                            (row[0], row[1])
+                            for row in ro_conn.execute("SELECT id, value FROM vectors ORDER BY id, part").fetchall()
+                        ]
+                finally:
+                    ro_conn.close()
+            except sqlite3.Error:
+                stored_vectors = []
+
+        eligible = {i: r for i, r in records.items() if i not in invalid and r.get("lifecycle_status") != "excluded"}
+        tokens = set(re.findall(r"\w+", norm(query)))
+        lex_ranked: list[tuple[int, str]] = []
+        for ident, rec in eligible.items():
+            words = set(re.findall(r"\w+", norm(rec["title"] + " " + canon(rec["payload"]))))
+            score = len(tokens & words)
+            if score:
+                lex_ranked.append((score, ident))
+        lex_ranked.sort(key=lambda pair: (-pair[0], pair[1]))
+        exact = [ident for _, ident in lex_ranked[:limit]]
+
+        semantic: list[str] = []
+        if self.embedder is not None and eligible and stored_vectors:
+            queries = self.embedder.chunks(query, "query")
+            eligible_rows = [(ident, raw) for ident, raw in stored_vectors if ident in eligible]
+            scores = _score_vectors(eligible_rows, queries)
+            semantic = sorted(scores, key=lambda i: (-scores[i], i))[:limit]
+
+        ranks: dict[str, float] = {}
+        for channel in (exact, semantic):
+            for pos_idx, ident in enumerate(channel):
+                ranks[ident] = ranks.get(ident, 0.0) + 1.0 / (60 + pos_idx + 1)
+        lex_pos = {ident: idx for idx, ident in enumerate(exact)}
+        sem_pos = {ident: idx for idx, ident in enumerate(semantic)}
+        ranked = sorted(ranks, key=lambda i: (-ranks[i], lex_pos.get(i, limit), sem_pos.get(i, limit), i))
+
+        reserve = min(3, max(1, limit // 3)) if depth and limit > 1 else 0
+        selected = ranked[: max(1, limit - reserve)]
+        visited = set(selected)
+        for _ in range(depth):
+            extra: list[str] = []
+            frontier = set(selected)
+            for ident in selected:
+                for ref in refs(records[ident]["payload"]):
+                    target = ref.get("record_id")
+                    if target in eligible and target not in visited:
+                        visited.add(target)
+                        extra.append(target)
+            for ident in sorted(eligible):
+                if ident not in visited and any(
+                    ref.get("record_id") in frontier for ref in refs(records[ident]["payload"])
+                ):
+                    visited.add(ident)
+                    extra.append(ident)
+            selected = (selected + extra)[:limit]
+        selected = (selected + [ident for ident in ranked if ident not in selected])[:limit]
+
+        raw_res = {
+            "mode": "hybrid_lexical_vector_graph" if (self.embedder is not None and stored_vectors) else "lexical_and_graph",
+            "generation": generation,
+            "cache_reused": False,
+            "scope": self.scope,
+            "results": [
+                {
+                    "id": ident,
+                    "revision": records[ident]["revision"],
+                    "title": records[ident]["title"],
+                    "record_type": records[ident]["record_type"],
+                    "record": records[ident],
+                }
+                for ident in selected
+            ],
+            "issues": issues,
+            "excluded_stale": len(invalid),
+            "limits": [
+                "Ranking não comprova identidade, veracidade ou causalidade.",
+                "A resposta usa a nota canônica completa, não somente o vetor.",
+            ],
+        }
+        return raw_res, records, paths
+
+    def search(self, data: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
         """Executa busca híbrida lexical + grafo + ONNX E5 filtrando derivados suspensos."""
         from nucleo import Invalid
 
@@ -1281,8 +1927,11 @@ class EpistemicGatewayRuntime:
             if type(limit) is not int or type(depth) is not int:
                 raise Invalid("parâmetros 'limit' e 'depth' devem ser inteiros")
 
-            raw = self.retrieval.search(query, limit=limit, depth=depth)
-            records, paths, _ = self.knowledge.catalog()
+            if read_only:
+                raw, records, paths = self._search_read_only(query, limit=limit, depth=depth)
+            else:
+                raw = self.retrieval.search(query, limit=limit, depth=depth)
+                records, paths, _ = self.knowledge.catalog()
             digests, folders, classes = self._catalog_metadata(records, paths)
 
             enriched_results = []
@@ -1307,6 +1956,7 @@ class EpistemicGatewayRuntime:
             return {
                 "status": "ok",
                 "mode": raw["mode"],
+                "read_only": bool(read_only),
                 "embeddings_active": self.embedder is not None,
                 "generation": raw["generation"],
                 "cache_reused": raw["cache_reused"],
@@ -1316,6 +1966,17 @@ class EpistemicGatewayRuntime:
                 "issues": raw["issues"],
                 "limits": raw["limits"],
             }
+
+
+_WRITE_POST_PATHS = frozenset(
+    {
+        "/api/v1/sources",
+        "/api/v1/sources/rectify",
+        "/api/v1/knowledge",
+        "/api/v1/verify-claims",
+    }
+)
+_READ_POST_PATHS = frozenset({"/api/v1/search"})
 
 
 def create_gateway_server(
@@ -1331,6 +1992,8 @@ def create_gateway_server(
 
     resolved_api_token = (api_token or os.environ.get("EMC_GATEWAY_TOKEN") or "").strip() or secrets.token_urlsafe(32)
     ui_session_token = secrets.token_hex(24)
+    while _constant_time_token_eq(ui_session_token, resolved_api_token):
+        ui_session_token = secrets.token_hex(24)
 
     class GatewayRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1412,9 +2075,10 @@ def create_gateway_server(
                     return False
             return True
 
-        def _verify_bearer_auth(self) -> bool:
+        def _authenticate_bearer(self) -> str | None:
+            """Autentica Bearer e retorna perfil explícito `'read_write'` ou `'read_only'` (Finding #3)."""
             if not self._verify_cross_site_headers():
-                return False
+                return None
             auth_header = (self.headers.get("Authorization") or "").strip()
             scheme, sep, raw_token = auth_header.partition(" ")
             supplied = raw_token.strip() if sep else ""
@@ -1427,20 +2091,40 @@ def create_gateway_server(
                     },
                     code=401,
                 )
-                return False
+                return None
             is_api = _constant_time_token_eq(supplied, resolved_api_token)
             is_ui = _constant_time_token_eq(supplied, ui_session_token)
-            if not (is_api or is_ui):
-                self._send_json(
-                    {
-                        "status": "unauthorized",
-                        "error": "invalid_bearer_token",
-                        "reason": "Token Bearer inválido.",
-                    },
-                    code=401,
-                )
-                return False
-            return True
+            if is_api:
+                return "read_write"
+            if is_ui:
+                return "read_only"
+            self._send_json(
+                {
+                    "status": "unauthorized",
+                    "error": "invalid_bearer_token",
+                    "reason": "Token Bearer inválido.",
+                },
+                code=401,
+            )
+            return None
+
+        def _require_scope(self, current_scope: str, required_scope: str = "read_write") -> bool:
+            if required_scope == "read_only" or current_scope == "read_write":
+                return True
+            self._send_json(
+                {
+                    "status": "forbidden",
+                    "error": "insufficient_scope",
+                    "required_scope": required_scope,
+                    "current_scope": current_scope,
+                    "reason": (
+                        "A sessão da interface possui escopo 'read_only'. "
+                        "Operações de escrita exigem o token Bearer de operador ('read_write')."
+                    ),
+                },
+                code=403,
+            )
+            return False
 
         def _read_json_body(self) -> dict[str, Any] | None:
             if self.headers.get("Transfer-Encoding"):
@@ -1543,14 +2227,17 @@ def create_gateway_server(
                     self.close_connection = True
                 return
 
-            if not self._verify_bearer_auth():
+            auth_scope = self._authenticate_bearer()
+            if auth_scope is None:
                 return
 
             from nucleo import Conflict, Invalid, Locked, Uncertain
 
             try:
                 if path == "/api/v1/health":
-                    self._send_json(runtime.health(), code=200)
+                    health_payload = runtime.health()
+                    health_payload["auth_scope"] = auth_scope
+                    self._send_json(health_payload, code=200)
                 elif path == "/api/v1/graph":
                     qs = urllib.parse.parse_qs(parsed.query)
                     inc_sup = str((qs.get("include_superseded") or ["false"])[0]).lower() in ("1", "true", "yes")
@@ -1609,14 +2296,20 @@ def create_gateway_server(
             self._init_request_tracking()
             if not self._verify_host():
                 return
-            if not self._verify_bearer_auth():
-                return
-            data = self._read_json_body()
-            if data is None:
+            auth_scope = self._authenticate_bearer()
+            if auth_scope is None:
                 return
 
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
+
+            if path in _WRITE_POST_PATHS or path not in _READ_POST_PATHS:
+                if not self._require_scope(auth_scope, "read_write"):
+                    return
+
+            data = self._read_json_body()
+            if data is None:
+                return
 
             from atribuicao import AttributionError
             from nucleo import Conflict, Invalid, Locked, Uncertain
@@ -1631,7 +2324,7 @@ def create_gateway_server(
                 elif path == "/api/v1/verify-claims":
                     self._send_json(runtime.verify_claims(data), code=200)
                 elif path == "/api/v1/search":
-                    self._send_json(runtime.search(data), code=200)
+                    self._send_json(runtime.search(data, read_only=(auth_scope != "read_write")), code=200)
                 else:
                     self._send_json(
                         {"status": "not_found", "error": "route_not_found", "reason": f"Endpoint POST inexistente: {path}"},

@@ -13,6 +13,25 @@ else:
 HOME=Path(__file__).resolve().parent.parent
 REAL_VAULT=Path(os.environ.get('EMC_VAULT',str(HOME/'meu-cofre'))).resolve()
 REAL_SYSTEM=Path(os.environ.get('EMC_SYSTEM',str(HOME))).resolve()
+def _authorized_env_roots():
+    raw=os.environ.get('EMC_AUTHORIZED_ROOTS','')
+    roots=[]
+    for entry in raw.split(os.pathsep):
+        cleaned=entry.strip()
+        if not cleaned:continue
+        try:roots.append(Path(cleaned).resolve())
+        except (OSError,RuntimeError,ValueError):continue
+    return roots
+def is_authorized_scope(root,vault)->bool:
+    try:r=Path(root).resolve(); v=Path(vault).resolve()
+    except (OSError,RuntimeError,TypeError,ValueError):return False
+    if r==REAL_SYSTEM and v==REAL_VAULT:return True
+    temp=(REAL_SYSTEM/'testes_temporarios').resolve()
+    if temp in r.parents and temp in v.parents:return True
+    extra=_authorized_env_roots()
+    if extra and any(r==base or base in r.parents for base in extra) and any(v==base or base in v.parents for base in extra):
+        return True
+    return False
 def config_file(root,name):
     root=Path(root); direct=root/name; cfg=root/'config'/name
     return direct if direct.exists() or not cfg.exists() else cfg
@@ -148,10 +167,10 @@ def filename(title,ident,existing):
     return name
 
 class Store:
+    is_authorized_scope=staticmethod(is_authorized_scope)
     def __init__(self,root=REAL_SYSTEM,vault=REAL_VAULT):
         self.root=Path(root).resolve(); self.vault=Path(vault).resolve()
-        temp=(REAL_SYSTEM/'testes_temporarios').resolve()
-        if not ((self.root==REAL_SYSTEM and self.vault==REAL_VAULT) or (temp in self.root.parents and temp in self.vault.parents)):
+        if not is_authorized_scope(self.root,self.vault):
             raise Invalid('raiz fora do escopo autorizado')
         self.folder=self.vault/'30_Fontes'; self.hist=self.root/'estado'/'revisoes'; self.db=self.root/'estado'/'controle.sqlite3'
         for p in (self.folder,self.hist,self.db.parent):p.mkdir(parents=True,exist_ok=True)

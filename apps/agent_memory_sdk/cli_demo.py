@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -31,21 +32,42 @@ if str(REPO_ROOT) not in sys.path:
 from apps.agent_memory_sdk.client import (
     EpistemicMemoryClient,
     ErrorCode,
-    bootstrap_workspace_env,
     make_operation_key,
 )
+
+
+def _authorize_disposable_dir(run_dir: Path) -> str | None:
+    previous = os.environ.get("EMC_AUTHORIZED_ROOTS")
+    resolved = str(run_dir.resolve())
+    entries = [p.strip() for p in (previous or "").split(os.pathsep) if p.strip()]
+    if resolved not in entries:
+        entries.append(resolved)
+    os.environ["EMC_AUTHORIZED_ROOTS"] = os.pathsep.join(entries)
+    return previous
+
+
+def _restore_authorized_roots(previous: str | None) -> None:
+    if previous is None:
+        os.environ.pop("EMC_AUTHORIZED_ROOTS", None)
+    else:
+        os.environ["EMC_AUTHORIZED_ROOTS"] = previous
 
 
 def run_multi_agent_handoff(
     workspace_dir: str | Path,
     *,
     enable_embeddings: bool | None = None,
+    simulate_failure: bool = False,
 ) -> dict[str, Any]:
     """Executa o pipeline completo de 3 agentes + retificação em cascata e valida invariantes."""
+    enforce_access = "CEREBRO_PESSOAL_ACESSO" in os.environ
     client = EpistemicMemoryClient.from_workspace(
         workspace_dir,
         enable_embeddings=enable_embeddings,
+        require_access_env=True if enforce_access else None,
     )
+    if simulate_failure or os.environ.get("EMC_SDK_DEMO_FAIL") == "1":
+        raise RuntimeError("Falha simulada após inicialização do subdiretório descartável da demonstração.")
 
     # =========================================================================
     # Etapa 1 — Researcher Agent (ingestão primária via Function-Calling + SDK)
@@ -348,44 +370,94 @@ def main(argv: list[str] | None = None) -> int:
         "--workspace",
         default=None,
         help=(
-            "Diretório opcional para executar a demonstração. Se omitido, cria um "
-            "diretório temporário descartável em testes_temporarios/ e remove ao final."
+            "Diretório pai opcional onde será criado um subdiretório descartável próprio "
+            "(emc-sdk-demo-*) para a execução. Se omitido, usa diretório temporário e remove ao final."
         ),
     )
     parser.add_argument(
         "--cleanup",
         action="store_true",
-        help="Remove o diretório informado em --workspace após concluir a execução.",
+        help=(
+            "Remove estritamente o subdiretório descartável emc-sdk-demo-* criado para esta execução, "
+            "preservando intacto qualquer arquivo preexistente no diretório --workspace."
+        ),
     )
     parser.add_argument(
         "--no-embeddings",
         action="store_true",
         help="Força busca lexical + grafo sem carregar o modelo vetorial ONNX E5.",
     )
+    parser.add_argument(
+        "--simulate-failure",
+        action="store_true",
+        help="Simula falha controlada após criar o subdiretório descartável (para auditoria de limpeza segura).",
+    )
     args = parser.parse_args(argv)
 
     enable_emb: bool | None = False if args.no_embeddings else None
 
     if args.workspace is None:
-        temp_base = REPO_ROOT / "testes_temporarios"
-        temp_base.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="sdk-demo-", dir=temp_base) as tmp_dir:
-            report = run_multi_agent_handoff(tmp_dir, enable_embeddings=enable_emb)
-            report["workspace_cleaned_up"] = True
-            print(json.dumps(report, ensure_ascii=False, indent=2))
+        in_repo_clone = (REPO_ROOT / "src" / "nucleo.py").is_file()
+        if in_repo_clone:
+            temp_base: Path | None = REPO_ROOT / "testes_temporarios"
+            assert temp_base is not None
+            temp_base.mkdir(parents=True, exist_ok=True)
+        else:
+            temp_base = None
+        with tempfile.TemporaryDirectory(prefix="emc-sdk-demo-", dir=temp_base) as tmp_dir:
+            prev_auth = _authorize_disposable_dir(Path(tmp_dir))
+            try:
+                report = run_multi_agent_handoff(
+                    tmp_dir,
+                    enable_embeddings=enable_emb,
+                    simulate_failure=bool(args.simulate_failure),
+                )
+                report["workspace_cleaned_up"] = True
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            finally:
+                _restore_authorized_roots(prev_auth)
         return 0
 
-    ws_path = Path(args.workspace).resolve()
-    temp_root = (REPO_ROOT / "testes_temporarios").resolve()
-    if temp_root not in ws_path.parents:
-        bootstrap_workspace_env(ws_path)
+    ws_raw = Path(args.workspace)
+    if ws_raw.is_symlink():
+        raise ValueError("O caminho informado em --workspace não pode ser um link simbólico.")
+    ws_path = ws_raw.resolve()
+    if ws_path.exists() and not ws_path.is_dir():
+        raise ValueError("O caminho informado em --workspace já existe e não é um diretório.")
+
+    created_parent = not ws_path.exists()
+    run_dir: Path | None = None
+    prev_auth: str | None = None
     try:
-        report = run_multi_agent_handoff(ws_path, enable_embeddings=enable_emb)
+        if created_parent:
+            ws_path.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="emc-sdk-demo-", dir=ws_path)).resolve()
+        prev_auth = _authorize_disposable_dir(run_dir)
+        report = run_multi_agent_handoff(
+            run_dir,
+            enable_embeddings=enable_emb,
+            simulate_failure=bool(args.simulate_failure),
+        )
+        report["workspace_parent"] = ws_path.as_posix()
+        report["run_directory"] = run_dir.as_posix()
         report["workspace_cleaned_up"] = bool(args.cleanup)
         print(json.dumps(report, ensure_ascii=False, indent=2))
     finally:
-        if args.cleanup and ws_path.exists():
-            shutil.rmtree(ws_path, ignore_errors=True)
+        _restore_authorized_roots(prev_auth)
+        if args.cleanup:
+            if (
+                run_dir is not None
+                and run_dir.exists()
+                and not run_dir.is_symlink()
+                and run_dir.resolve().parent == ws_path
+                and run_dir.name.startswith("emc-sdk-demo-")
+            ):
+                shutil.rmtree(run_dir)
+            if created_parent and ws_path.exists() and not ws_path.is_symlink():
+                try:
+                    ws_path.rmdir()
+                except OSError:
+                    pass
     return 0
 
 

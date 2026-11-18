@@ -9,7 +9,7 @@ from provedores import TextModel
 from pesquisa import research,TERMS
 from revalidacao import review,automatic_payload
 
-DEFAULT={'enabled':False,'model':{'enabled':False},'embeddings':{'enabled':False},
+DEFAULT={'enabled':False,'model':{'enabled':False},'embeddings':{'enabled':False,'folder':'','vector_storage':'packed_f64'},
          'max_actions':32,'max_model_calls':3,'max_seconds':600,'auto_process_sources':False,
          'auto_adopt_config':False,'message_codec':'compact','retrieval_policy':'hybrid','owner_person_id':None}
 _EMBEDDERS={}
@@ -34,8 +34,16 @@ def config(sources):
     if path.exists():
         if path.is_symlink():raise Invalid('configuração redirecionada')
         raw=json.loads(path.read_text(encoding='utf-8'))
-        if set(raw)-set(DEFAULT):raise Invalid('opção de execução não reconhecida')
+        if not isinstance(raw,dict) or set(raw)-set(DEFAULT):raise Invalid('opção de execução não reconhecida')
         result.update(raw)
+    for name in ('enabled','auto_process_sources','auto_adopt_config'):
+        if type(result[name]) is not bool:raise Invalid('permissão de execução inválida: '+name)
+    for name in ('model','embeddings'):
+        if not isinstance(result[name],dict) or type(result[name].get('enabled',False)) is not bool:
+            raise Invalid('configuração de provedor inválida: '+name)
+    result['embeddings']={**DEFAULT['embeddings'],**result['embeddings']}
+    if not isinstance(result['embeddings'].get('vector_storage'),str) or result['embeddings']['vector_storage'] not in ('json','packed_f64'):
+        raise Invalid('formato de armazenamento vetorial desconhecido')
     for name,low,high in (('max_actions',1,64),('max_model_calls',0,16),('max_seconds',1,3600)):
         if type(result[name])is not int or not low<=result[name]<=high:raise Invalid('limite de execução inválido: '+name)
     if result['message_codec'] not in ('compact','pretty') or result['retrieval_policy'] not in ('hybrid','lexical'):
@@ -43,6 +51,15 @@ def config(sources):
     if result['owner_person_id'] is not None and (not isinstance(result['owner_person_id'],str) or not result['owner_person_id'].strip()):
         raise Invalid('identidade do proprietário inválida')
     return result
+
+
+def _load_manifest(sources):
+    manifest_path=config_file(sources.root,'manual_manifest.json')
+    if manifest_path.is_symlink():raise Invalid('manual fora do escopo')
+    if manifest_path.exists():
+        return json.loads(manifest_path.read_text(encoding='utf-8'))
+    from recursos_pacote import load_manual_manifest
+    return load_manual_manifest()
 
 
 def validate_citations(sources,citations):
@@ -68,22 +85,31 @@ class Engine:
             folder=self.cfg['embeddings']['folder']
             if folder not in _EMBEDDERS:_EMBEDDERS[folder]=LocalEmbeddings(folder)
             embedder=_EMBEDDERS[folder]
-        self.retrieval=Retrieval(sources,embedder if self.cfg['retrieval_policy']=='hybrid' else None)
-        manifest=json.loads(config_file(sources.root,'manual_manifest.json').read_text(encoding='utf-8'))
+        self.retrieval=Retrieval(sources,embedder if self.cfg['retrieval_policy']=='hybrid' else None,
+                                 vector_storage=self.cfg['embeddings'].get('vector_storage','packed_f64'))
+        manifest=_load_manifest(sources)
         self.manual={}
         for name,digest in manifest.items():
+            if not isinstance(name,str) or not name or '/' in name or '\\' in name or name in ('.','..'):
+                raise Invalid('manual fora do escopo')
             manual_dir=sources.vault/'00_Manual'
+            if manual_dir.is_symlink():raise Invalid('manual fora do escopo')
             path=manual_dir/name
-            if sources.root==REAL_SYSTEM and not path.exists() and not path.is_symlink() and (REAL_SYSTEM/'00_Manual'/name).exists():
+            if sources.root==REAL_SYSTEM and not path.exists() and not path.is_symlink() and ((REAL_SYSTEM/'00_Manual'/name).exists() or (REAL_SYSTEM/'00_Manual'/name).is_symlink()):
                 manual_dir=REAL_SYSTEM/'00_Manual'
+                if manual_dir.is_symlink():raise Invalid('manual fora do escopo')
                 path=manual_dir/name
             if path.is_symlink() or path.resolve().parent!=manual_dir.resolve():raise Invalid('manual fora do escopo')
-            raw=path.read_bytes()
+            if path.exists():
+                raw=path.read_bytes()
+            else:
+                from recursos_pacote import read_manual_bytes
+                raw=read_manual_bytes(name)
             if sha(raw)!=digest:raise Conflict('manual divergente do manifesto')
             self.manual[name]=raw.decode('utf-8-sig')
         version=sha(canon([manifest,self.cfg]).encode())
         self.q=Coordinator(sources.root/'estado'/'coordenacao',authorize=lambda:self.authorize() and config(sources)['enabled'],
-                           context_token=lambda:sha(canon([json.loads(config_file(sources.root,'manual_manifest.json').read_text(encoding='utf-8')),config(sources)]).encode()),
+                           context_token=lambda:sha(canon([_load_manifest(sources),config(sources)]).encode()),
                            origin_validator=self.valid_origin)
         with self.q.connect() as c:
             c.execute('CREATE TABLE IF NOT EXISTS owned_sources(id TEXT,revision INTEGER,execution_id TEXT,PRIMARY KEY(id,revision))')

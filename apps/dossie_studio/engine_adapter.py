@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import importlib.resources
 import json
 import os
 import sys
@@ -15,7 +16,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = REPO_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
+if SRC_DIR.is_dir() and str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 
@@ -32,13 +33,90 @@ VAULT_FOLDERS = (
 )
 
 
+def _append_authorized_root(root_path: Path) -> None:
+    resolved = str(root_path.resolve())
+    existing = [p.strip() for p in os.environ.get("EMC_AUTHORIZED_ROOTS", "").split(os.pathsep) if p.strip()]
+    if resolved not in existing:
+        existing.append(resolved)
+        os.environ["EMC_AUTHORIZED_ROOTS"] = os.pathsep.join(existing)
+
+
+def _is_authorized_scope(system_root: Path, vault_root: Path) -> bool:
+    import nucleo
+
+    checker = getattr(nucleo, "is_authorized_scope", None)
+    if callable(checker):
+        return bool(checker(system_root, vault_root))
+    r = Path(system_root).resolve()
+    v = Path(vault_root).resolve()
+    real_sys = Path(nucleo.REAL_SYSTEM).resolve()
+    real_vault = Path(nucleo.REAL_VAULT).resolve()
+    temp = (real_sys / "testes_temporarios").resolve()
+    if (r == real_sys and v == real_vault) or (temp in r.parents and temp in v.parents):
+        return True
+    for entry in os.environ.get("EMC_AUTHORIZED_ROOTS", "").split(os.pathsep):
+        cleaned = entry.strip()
+        if not cleaned:
+            continue
+        base = Path(cleaned).resolve()
+        if (r == base or base in r.parents) and (v == base or base in v.parents):
+            return True
+    return False
+
+
+def _bootstrap_manual_files(system_root: Path, vault_root: Path) -> None:
+    from autonomia import atomic_json
+    from nucleo import REAL_SYSTEM, config_file
+
+    try:
+        from recursos_pacote import bootstrap_manual_tree
+    except ImportError:
+        bootstrap_manual_tree = None  # type: ignore[assignment]
+
+    if callable(bootstrap_manual_tree):
+        bootstrap_manual_tree(system_root, vault_root)
+        return
+
+    manifest: dict[str, str] | None = None
+    manifest_src = config_file(REPO_ROOT, "manual_manifest.json")
+    if not manifest_src.exists():
+        manifest_src = config_file(REAL_SYSTEM, "manual_manifest.json")
+    if manifest_src.exists():
+        manifest = json.loads(manifest_src.read_text(encoding="utf-8"))
+    else:
+        try:
+            res_manifest = importlib.resources.files("emc_resources").joinpath("config/manual_manifest.json")
+            manifest = json.loads(res_manifest.read_text(encoding="utf-8"))
+        except (ModuleNotFoundError, FileNotFoundError):
+            manifest = None
+
+    if manifest is None:
+        raise FileNotFoundError("manual_manifest.json não encontrado no repositório nem em emc_resources")
+
+    manual_src_dir = REPO_ROOT / "00_Manual"
+    for name in manifest:
+        dest = vault_root / "00_Manual" / name
+        if dest.exists():
+            continue
+        src_candidate = manual_src_dir / name
+        if src_candidate.is_file():
+            dest.write_bytes(src_candidate.read_bytes())
+        else:
+            res_chapter = importlib.resources.files("emc_resources").joinpath("manual", name)
+            dest.write_bytes(res_chapter.read_bytes())
+
+    if not (system_root / "manual_manifest.json").exists():
+        atomic_json(system_root / "manual_manifest.json", manifest)
+
+
 def bootstrap_environment(workspace_dir: str | Path) -> tuple[Path, Path]:
-    """Configura `EMC_SYSTEM` e `EMC_VAULT` antes da carga inicial em processos dedicados."""
+    """Configura `EMC_SYSTEM`, `EMC_VAULT` e escopo autorizado para processos dedicados do CLI."""
     ws = Path(workspace_dir).resolve()
     sys_root = ws / "sistema"
     vault_root = ws / "cofre"
     os.environ["EMC_SYSTEM"] = str(sys_root)
     os.environ["EMC_VAULT"] = str(vault_root)
+    _append_authorized_root(ws)
     return sys_root, vault_root
 
 
@@ -49,44 +127,40 @@ class DossieWorkspace:
         from autonomia import atomic_json
         from conhecimento import Knowledge
         from execucao import DEFAULT
-        from nucleo import REAL_SYSTEM, Store, config_file
+        from nucleo import Invalid, Store
         from recuperacao import LocalEmbeddings, Retrieval
 
         self.system_root = Path(system_root).resolve()
         self.vault_root = Path(vault_root).resolve()
+        if not _is_authorized_scope(self.system_root, self.vault_root):
+            raise Invalid("raiz fora do escopo autorizado")
+
         self.system_root.mkdir(parents=True, exist_ok=True)
         self.vault_root.mkdir(parents=True, exist_ok=True)
         for folder in VAULT_FOLDERS:
             (self.vault_root / folder).mkdir(parents=True, exist_ok=True)
 
-        manifest_src = config_file(REPO_ROOT, "manual_manifest.json")
-        if not manifest_src.exists():
-            manifest_src = config_file(REAL_SYSTEM, "manual_manifest.json")
-        manifest = json.loads(manifest_src.read_text(encoding="utf-8"))
-        manual_src_dir = REPO_ROOT / "00_Manual"
-        for name in manifest:
-            dest = self.vault_root / "00_Manual" / name
-            if not dest.exists():
-                dest.write_bytes((manual_src_dir / name).read_bytes())
-
-        if not (self.system_root / "manual_manifest.json").exists():
-            atomic_json(self.system_root / "manual_manifest.json", manifest)
+        _bootstrap_manual_files(self.system_root, self.vault_root)
 
         self.store = Store(self.system_root, self.vault_root)
         self.knowledge = Knowledge(self.store)
 
         embedder = None
-        if enable_embeddings:
-            emb_dir = os.environ.get("EMC_EMBEDDINGS_DIR")
-            candidate = Path(emb_dir) if emb_dir else (REPO_ROOT / "modelos" / "e5-multilingual-small")
-            if (candidate / "model.onnx").is_file() and (candidate / "tokenizer.json").is_file():
-                embedder = LocalEmbeddings(candidate)
+        emb_dir = os.environ.get("EMC_EMBEDDINGS_DIR", "").strip()
+        default_model_dir = REPO_ROOT / "modelos" / "e5-multilingual-small"
+        candidate = Path(emb_dir) if emb_dir else default_model_dir
+        if enable_embeddings and (candidate / "model.onnx").is_file() and (candidate / "tokenizer.json").is_file():
+            embedder = LocalEmbeddings(candidate)
 
         cfg_path = self.system_root / "execucao.json"
         if not cfg_path.exists():
             cfg = copy.deepcopy(DEFAULT)
             cfg["enabled"] = True
-            cfg["embeddings"] = {"enabled": embedder is not None, "folder": str(REPO_ROOT / "modelos" / "e5-multilingual-small")}
+            emb_cfg = dict(cfg.get("embeddings", {}))
+            emb_cfg["enabled"] = embedder is not None
+            emb_cfg["folder"] = str(candidate) if (emb_dir or default_model_dir.is_dir()) else ""
+            emb_cfg.setdefault("vector_storage", "packed_f64")
+            cfg["embeddings"] = emb_cfg
             atomic_json(cfg_path, cfg)
 
         self.embedder = embedder
@@ -166,15 +240,25 @@ class DossieWorkspace:
             "diff": diff_lines,
         }
 
-    def source_revision_diff(self, record_id: str, old_rev: int, new_rev: int) -> list[str]:
-        from nucleo import parse
+    def _read_source_content_at_revision(self, record_id: str, rev: int, current: dict | None = None) -> str:
+        from nucleo import Conflict, parse
 
-        hist_file = self.system_root / "estado" / "revisoes" / record_id / f"{old_rev}.md"
-        old_text = ""
-        if hist_file.is_file():
-            old_text = str(parse(hist_file.read_bytes())["payload"].get("content", ""))
+        live = current if current is not None else self.store.read(record_id)
+        if live["revision"] == rev:
+            return str(live["payload"].get("content", ""))
+        hist_root = (self.system_root / "estado" / "revisoes").resolve()
+        hist_file = self.system_root / "estado" / "revisoes" / record_id / f"{rev}.md"
+        if hist_file.is_symlink() or not hist_file.resolve().is_relative_to(hist_root) or not hist_file.is_file():
+            raise Conflict(f"snapshot histórico da revisão {rev} indisponível para {record_id}")
+        parsed = parse(hist_file.read_bytes())
+        if parsed.get("id") != record_id or parsed.get("revision") != rev:
+            raise Conflict("identidade ou revisão histórica divergente")
+        return str(parsed["payload"].get("content", ""))
+
+    def source_revision_diff(self, record_id: str, old_rev: int, new_rev: int) -> list[str]:
         current = self.store.read(record_id)
-        new_text = str(current["payload"].get("content", "")) if current["revision"] == new_rev else ""
+        old_text = self._read_source_content_at_revision(record_id, old_rev, current=current)
+        new_text = self._read_source_content_at_revision(record_id, new_rev, current=current)
         return list(
             difflib.unified_diff(
                 old_text.splitlines(),

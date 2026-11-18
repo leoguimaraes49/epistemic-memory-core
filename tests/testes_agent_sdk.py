@@ -323,7 +323,7 @@ class EpistemicAgentMemorySDKTests(unittest.TestCase):
                 "title": "Pessoa Teste",
                 "entity_kind": "person",
                 "origin_refs": [{"record_id": src_id, "revision": 1}],
-                "fields": {"diagnosis": "TDAH"},
+                "fields": {"diagnosis": "CONDICAO_FICTICIA_NEUTRA"},
             },
         )
         assert isinstance(clinical_resp, dict)
@@ -762,6 +762,436 @@ class EpistemicAgentMemorySDKTests(unittest.TestCase):
             report["handoff"]["cascade_invalidation"]["synthesis_validity_after"],
             "needs_revalidation",
         )
+
+    def test_replay_historical_receipts_across_multiple_rectifications_and_restarts(self) -> None:
+        from nucleo import Store, sha
+
+        # 1. Criação da revisão 1 ("lote A", chave k1) + derivados presos à revisão 1
+        created_k1 = self.client.remember_source(
+            "Controle de Lotes Operacionais",
+            "lote A",
+            source_kind="document",
+            operation_key="k1",
+        )
+        src_id = created_k1["id"]
+        self.assertEqual(created_k1["revision"], 1)
+        self.assertEqual(created_k1["revision_count_at_operation"], 1)
+        self.assertFalse(created_k1["replayed"])
+        self.assertEqual(created_k1["current_state"]["current_revision"], 1)
+        self.assertEqual(created_k1["current_state"]["total_revisions"], 1)
+        sha_rev1 = created_k1["sha256"]
+        self.assertEqual(created_k1["current_state"]["current_sha256"], sha_rev1)
+
+        ata = self.client.remember_source(
+            "Ata Operacional Lote A",
+            "Patrícia Gomes validou a conferência documental do lote inicial.",
+            source_kind="conversation",
+            operation_key="k-ata-lote",
+        )
+        patricia = self.client.register_entity(
+            "Patrícia Gomes",
+            "person",
+            [ata["rev_ref"]],
+            fields={"aliases": ["Patrícia"]},
+            operation_key="k-person-patricia",
+        )
+        ent_a = self.client.register_entity(
+            "Projeto Lote A",
+            "project",
+            [created_k1["rev_ref"]],
+            fields={"purpose": "Rastrear lote A", "project_status": "active"},
+            operation_key="k-ent-a",
+        )
+        fact_a = self.client.assert_fact(
+            "Validação registrada por Patrícia Gomes",
+            subject_ref=patricia["rev_ref"],
+            predicate="reports_preference",
+            nature="third_party_report",
+            source_refs=[ata["rev_ref"], created_k1["rev_ref"]],
+            value={"type": "text", "content": "conferência documental do lote inicial"},
+            evidence_quote="Patrícia Gomes validou a conferência documental do lote inicial.",
+            evidence_source_ref=ata["rev_ref"],
+            operation_key="k-fact-a",
+        )
+        syn_a = self.client.synthesize(
+            "Síntese do Lote A",
+            content="Síntese vinculada exclusivamente ao lote A na revisão 1.",
+            scope="Revisão 1",
+            basis_refs=[created_k1["rev_ref"], ent_a["rev_ref"], fact_a["rev_ref"]],
+            limitations=["Invalida se o lote mudar"],
+            operation_key="k-syn-a",
+        )
+        dec_opts = [
+            {
+                "descricao": "Liberar expedição com base no lote A",
+                "origem": "relatada_pelo_usuario",
+                "pros": ["Conferido"],
+                "contras": ["Janela curta"],
+                "incertezas": ["Transporte"],
+            },
+            {
+                "descricao": "Aguardar recontagem",
+                "origem": "sugerida_pela_ia",
+                "pros": ["Dupla checagem"],
+                "contras": ["Atraso"],
+                "incertezas": ["Disponibilidade de pátio"],
+            },
+        ]
+        dec_a = self.client.prepare_decision(
+            "Expedição do Lote",
+            situation="Avaliar expedição do lote registrado.",
+            options=dec_opts,
+            source_refs=[created_k1["rev_ref"], ata["rev_ref"]],
+            gaps=["Qual o horário limite da transportadora?"],
+            operation_key="k-dec-a",
+        )
+
+        # 2. Primeira retificação: 1 -> 2 ("lote B", chave k2)
+        rect_k2 = self.client.rectify_source(
+            src_id,
+            1,
+            "lote B",
+            "Primeira retificação para lote B",
+            operation_key="k2",
+        )
+        sha_rev2 = rect_k2["new_sha256"]
+        self.assertFalse(rect_k2["replayed"])
+        self.assertEqual(rect_k2["revision"], 2)
+        self.assertEqual(rect_k2["from_revision"], 1)
+        self.assertEqual(rect_k2["to_revision"], 2)
+        self.assertEqual(rect_k2["old_sha256"], sha_rev1)
+        self.assertEqual(rect_k2["sha256"], sha_rev2)
+        self.assertNotEqual(sha_rev1, sha_rev2)
+        self.assertEqual(rect_k2["revision_count_at_operation"], 2)
+        self.assertIn("-lote A", rect_k2["diff"])
+        self.assertIn("+lote B", rect_k2["diff"])
+        self.assertIn(ent_a["id"], rect_k2["newly_suspended_ids"])
+        self.assertIn(syn_a["id"], rect_k2["newly_suspended_ids"])
+
+        # Entidade presa à revisão 2 (será suspensa apenas em k3, nunca em k2!)
+        ent_b = self.client.register_entity(
+            "Projeto Lote B",
+            "project",
+            [rect_k2["rev_ref"]],
+            fields={"purpose": "Rastrear lote B", "project_status": "active"},
+            operation_key="k-ent-b",
+        )
+
+        # 3. Segunda retificação: 2 -> 3 ("lote C", chave k3)
+        rect_k3 = self.client.rectify_source(
+            src_id,
+            2,
+            "lote C",
+            "Segunda retificação para lote C",
+            operation_key="k3",
+        )
+        sha_rev3 = rect_k3["new_sha256"]
+        self.assertEqual(rect_k3["revision"], 3)
+        self.assertEqual(rect_k3["old_sha256"], sha_rev2)
+        self.assertNotEqual(sha_rev2, sha_rev3)
+        self.assertIn("-lote B", rect_k3["diff"])
+        self.assertIn("+lote C", rect_k3["diff"])
+        self.assertEqual(rect_k3["newly_suspended_ids"], [ent_b["id"]])
+
+        # Confere os hashes físicos dos arquivos arquivados em estado/revisoes/<src_id>/
+        rev1_disk_sha = sha((self.client.system_root / "estado" / "revisoes" / src_id / "1.md").read_bytes())
+        rev2_disk_sha = sha((self.client.system_root / "estado" / "revisoes" / src_id / "2.md").read_bytes())
+        self.assertEqual(sha_rev1, rev1_disk_sha)
+        self.assertEqual(sha_rev2, rev2_disk_sha)
+
+        def _assert_exact_historical_replays(cli: EpistemicMemoryClient) -> None:
+            rep_k1 = cli.remember_source(
+                "Controle de Lotes Operacionais",
+                "lote A",
+                source_kind="document",
+                operation_key="k1",
+            )
+            self.assertTrue(rep_k1["replayed"])
+            self.assertEqual(rep_k1["id"], src_id)
+            self.assertEqual(rep_k1["revision"], 1)
+            self.assertEqual(rep_k1["rev_ref"], {"record_id": src_id, "revision": 1})
+            self.assertEqual(rep_k1["sha256"], sha_rev1)
+            self.assertNotEqual(rep_k1["sha256"], sha_rev3)
+            self.assertEqual(rep_k1["revision_count_at_operation"], 1)
+            self.assertEqual(rep_k1["current_state"]["current_revision"], 3)
+            self.assertEqual(rep_k1["current_state"]["current_sha256"], sha_rev3)
+            self.assertEqual(rep_k1["current_state"]["total_revisions"], 3)
+            self.assertIn(ent_b["id"], rep_k1["current_state"]["currently_stale_ids"])
+
+            rep_k2 = cli.rectify_source(
+                src_id,
+                1,
+                "lote B",
+                "Primeira retificação para lote B",
+                operation_key="k2",
+            )
+            self.assertTrue(rep_k2["replayed"])
+            self.assertEqual(rep_k2["revision"], 2)
+            self.assertEqual(rep_k2["from_revision"], 1)
+            self.assertEqual(rep_k2["to_revision"], 2)
+            self.assertEqual(rep_k2["old_sha256"], sha_rev1)
+            self.assertEqual(rep_k2["new_sha256"], sha_rev2)
+            self.assertEqual(rep_k2["sha256"], sha_rev2)
+            self.assertNotEqual(rep_k2["sha256"], sha_rev3)
+            self.assertEqual(rep_k2["revision_count_at_operation"], 2)
+            self.assertEqual(rep_k2["diff"], rect_k2["diff"])
+            self.assertIn("-lote A", rep_k2["diff"])
+            self.assertIn("+lote B", rep_k2["diff"])
+            self.assertFalse(any("lote C" in line for line in rep_k2["diff"]))
+            # O comprovante histórico de k2 preserva exatamente os suspensos da operação 1->2
+            self.assertEqual(rep_k2["newly_suspended_ids"], rect_k2["newly_suspended_ids"])
+            self.assertNotIn(ent_b["id"], rep_k2["newly_suspended_ids"])
+            # Enquanto current_state expõe separadamente o estado atual na revisão 3
+            self.assertEqual(rep_k2["current_state"]["current_revision"], 3)
+            self.assertEqual(rep_k2["current_state"]["current_sha256"], sha_rev3)
+            self.assertEqual(rep_k2["current_state"]["total_revisions"], 3)
+            self.assertIn(ent_b["id"], rep_k2["current_state"]["currently_stale_ids"])
+
+            # Replay de escritas derivadas mesmo após retificação da fonte primária
+            rep_ent = cli.register_entity(
+                "Projeto Lote A",
+                "project",
+                [created_k1["rev_ref"]],
+                fields={"purpose": "Rastrear lote A", "project_status": "active"},
+                operation_key="k-ent-a",
+            )
+            self.assertTrue(rep_ent["replayed"])
+            self.assertEqual(rep_ent["sha256"], ent_a["sha256"])
+            self.assertEqual(rep_ent["current_state"]["validity"], "needs_revalidation")
+
+            rep_fact = cli.assert_fact(
+                "Validação registrada por Patrícia Gomes",
+                subject_ref=patricia["rev_ref"],
+                predicate="reports_preference",
+                nature="third_party_report",
+                source_refs=[ata["rev_ref"], created_k1["rev_ref"]],
+                value={"type": "text", "content": "conferência documental do lote inicial"},
+                evidence_quote="Patrícia Gomes validou a conferência documental do lote inicial.",
+                evidence_source_ref=ata["rev_ref"],
+                operation_key="k-fact-a",
+            )
+            self.assertTrue(rep_fact["replayed"])
+            self.assertEqual(rep_fact["sha256"], fact_a["sha256"])
+            self.assertEqual(rep_fact["current_state"]["validity"], "needs_revalidation")
+
+            rep_syn = cli.synthesize(
+                "Síntese do Lote A",
+                content="Síntese vinculada exclusivamente ao lote A na revisão 1.",
+                scope="Revisão 1",
+                basis_refs=[created_k1["rev_ref"], ent_a["rev_ref"], fact_a["rev_ref"]],
+                limitations=["Invalida se o lote mudar"],
+                operation_key="k-syn-a",
+            )
+            self.assertTrue(rep_syn["replayed"])
+            self.assertEqual(rep_syn["sha256"], syn_a["sha256"])
+            self.assertEqual(rep_syn["current_state"]["validity"], "needs_revalidation")
+
+            rep_dec = cli.prepare_decision(
+                "Expedição do Lote",
+                situation="Avaliar expedição do lote registrado.",
+                options=dec_opts,
+                source_refs=[created_k1["rev_ref"], ata["rev_ref"]],
+                gaps=["Qual o horário limite da transportadora?"],
+                operation_key="k-dec-a",
+            )
+            self.assertTrue(rep_dec["replayed"])
+            self.assertEqual(rep_dec["sha256"], dec_a["sha256"])
+            self.assertEqual(rep_dec["analysis_sha256"], dec_a["analysis_sha256"])
+            self.assertEqual(rep_dec["current_state"]["validity"], "needs_revalidation")
+
+        # 4. Verifica no mesmo cliente E após reiniciar uma nova instância de EpistemicMemoryClient
+        _assert_exact_historical_replays(self.client)
+        restarted_client = EpistemicMemoryClient.from_workspace(self.ws_dir, enable_embeddings=False)
+        _assert_exact_historical_replays(restarted_client)
+        self.assertEqual(restarted_client.read_source(src_id)["payload"]["content"], "lote C")
+        self.assertEqual(restarted_client.read_source(src_id)["revision"], 3)
+
+        # 5. Evolução de entidade derivada 1 -> 2 -> 3 e replay de revisões históricas
+        ent_v1 = restarted_client.register_entity(
+            " Conceito Evolutivo ",
+            "concept",
+            [ata["rev_ref"]],
+            fields={"content": "versão 1", "idea_scope": "arquitetura"},
+            operation_key="ke1",
+        )
+        ent_v2 = restarted_client.register_entity(
+            "Conceito Evolutivo",
+            "concept",
+            [ata["rev_ref"]],
+            fields={"content": "versão 2", "idea_scope": "arquitetura"},
+            record_id=ent_v1["id"],
+            expected_revision=1,
+            operation_key="ke2",
+        )
+        ent_v3 = restarted_client.register_entity(
+            "Conceito Evolutivo",
+            "concept",
+            [ata["rev_ref"]],
+            fields={"content": "versão 3", "idea_scope": "arquitetura"},
+            record_id=ent_v1["id"],
+            expected_revision=2,
+            operation_key="ke3",
+        )
+        fresh_client = EpistemicMemoryClient.from_workspace(self.ws_dir, enable_embeddings=False)
+        rep_ke1 = fresh_client.register_entity(
+            " Conceito Evolutivo ",
+            "concept",
+            [ata["rev_ref"]],
+            fields={"content": "versão 1", "idea_scope": "arquitetura"},
+            operation_key="ke1",
+        )
+        rep_ke2 = fresh_client.register_entity(
+            "Conceito Evolutivo",
+            "concept",
+            [ata["rev_ref"]],
+            fields={"content": "versão 2", "idea_scope": "arquitetura"},
+            record_id=ent_v1["id"],
+            expected_revision=1,
+            operation_key="ke2",
+        )
+        self.assertTrue(rep_ke1["replayed"])
+        self.assertEqual(rep_ke1["sha256"], ent_v1["sha256"])
+        self.assertNotEqual(rep_ke1["sha256"], ent_v3["sha256"])
+        self.assertEqual(rep_ke1["current_state"]["current_revision"], 3)
+        self.assertTrue(rep_ke2["replayed"])
+        self.assertEqual(rep_ke2["old_sha256"], ent_v1["sha256"])
+        self.assertEqual(rep_ke2["new_sha256"], ent_v2["sha256"])
+        self.assertEqual(rep_ke2["current_state"]["current_sha256"], ent_v3["sha256"])
+
+        # 6. Reconstrução determinística de operações pré-existentes gravadas diretamente via Store
+        legacy_ws = self.base / "ws_legacy_store"
+        legacy_cli_init = EpistemicMemoryClient.from_workspace(legacy_ws, enable_embeddings=False)
+        raw_store = Store(legacy_cli_init.system_root, legacy_cli_init.vault_root)
+        leg_c1 = raw_store.apply("leg-k1", "create", title="Fonte Legada", text="lote A")
+        raw_store.apply("leg-k2", "correct", ident=leg_c1["id"], expected=1, text="lote B", reason="ajuste 1")
+        raw_store.apply("leg-k3", "correct", ident=leg_c1["id"], expected=2, text="lote C", reason="ajuste 2")
+
+        sdk_over_legacy = EpistemicMemoryClient.from_workspace(legacy_ws, enable_embeddings=False)
+        leg_rep1 = sdk_over_legacy.remember_source("Fonte Legada", "lote A", operation_key="leg-k1")
+        leg_rep2 = sdk_over_legacy.rectify_source(leg_c1["id"], 1, "lote B", "ajuste 1", operation_key="leg-k2")
+        self.assertTrue(leg_rep1["replayed"])
+        self.assertEqual(leg_rep1["revision"], 1)
+        self.assertEqual(
+            leg_rep1["sha256"],
+            sha((sdk_over_legacy.system_root / "estado" / "revisoes" / leg_c1["id"] / "1.md").read_bytes()),
+        )
+        self.assertTrue(leg_rep2["replayed"])
+        self.assertEqual(leg_rep2["old_sha256"], leg_rep1["sha256"])
+        self.assertEqual(
+            leg_rep2["new_sha256"],
+            sha((sdk_over_legacy.system_root / "estado" / "revisoes" / leg_c1["id"] / "2.md").read_bytes()),
+        )
+        self.assertIn("-lote A", leg_rep2["diff"])
+        self.assertIn("+lote B", leg_rep2["diff"])
+        self.assertEqual(leg_rep2["current_state"]["current_revision"], 3)
+
+    def test_cli_demo_cleanup_preserves_preexisting_files_on_success_and_failure(self) -> None:
+        from apps.agent_memory_sdk import cli_demo
+
+        existing_dir = self.base / "projeto_existente_usuario"
+        existing_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = existing_dir / "sentinel.txt"
+        sentinel.write_text("arquivo preexistente intocável\n", encoding="utf-8")
+        nested_dir = existing_dir / "submodulo"
+        nested_dir.mkdir()
+        nested_file = nested_dir / "dados.json"
+        nested_file.write_text('{"importante": true}\n', encoding="utf-8")
+
+        env = dict(os.environ, PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
+
+        # 1. Execução normal com --cleanup em diretório já existente
+        proc_ok = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "apps" / "agent_memory_sdk" / "cli_demo.py"),
+                "--workspace",
+                str(existing_dir),
+                "--cleanup",
+                "--no-embeddings",
+            ],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(proc_ok.returncode, 0, msg=proc_ok.stderr or proc_ok.stdout)
+        self.assertTrue(sentinel.is_file())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "arquivo preexistente intocável\n")
+        self.assertTrue(nested_file.is_file())
+        leftover_ok = [p.name for p in existing_dir.iterdir() if p.name.startswith("emc-sdk-demo-")]
+        self.assertEqual(leftover_ok, [])
+
+        # 2. Falha durante execução via subprocesso (--simulate-failure) com --cleanup
+        proc_fail = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "apps" / "agent_memory_sdk" / "cli_demo.py"),
+                "--workspace",
+                str(existing_dir),
+                "--cleanup",
+                "--no-embeddings",
+                "--simulate-failure",
+            ],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertNotEqual(proc_fail.returncode, 0)
+        self.assertTrue(sentinel.is_file())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "arquivo preexistente intocável\n")
+        self.assertTrue(nested_file.is_file())
+        leftover_fail = [p.name for p in existing_dir.iterdir() if p.name.startswith("emc-sdk-demo-")]
+        self.assertEqual(leftover_fail, [])
+
+        # 3. Falha simulada de inicialização in-process com --cleanup
+        with patch.object(cli_demo, "run_multi_agent_handoff", side_effect=RuntimeError("falha de boot")):
+            with self.assertRaises(RuntimeError):
+                cli_demo.main(["--workspace", str(existing_dir), "--cleanup", "--no-embeddings"])
+        self.assertTrue(sentinel.is_file())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "arquivo preexistente intocável\n")
+        self.assertEqual(
+            sorted(p.name for p in existing_dir.iterdir()),
+            ["sentinel.txt", "submodulo"],
+        )
+
+    def test_unauthorized_workspace_rejected_leaving_empty_folder_untouched(self) -> None:
+        from apps.dossie_studio.engine_adapter import DossieWorkspace
+
+        with tempfile.TemporaryDirectory(prefix="emc-unauth-sdk-") as external_tmp:
+            unauth_dir = Path(external_tmp) / "pasta_vazia_externa"
+            unauth_dir.mkdir()
+            self.assertEqual(os.listdir(unauth_dir), [])
+
+            clean_env = {k: v for k, v in os.environ.items() if k != "EMC_AUTHORIZED_ROOTS"}
+            with patch.dict(os.environ, clean_env, clear=True):
+                with self.assertRaises(Invalid) as ctx_sdk:
+                    EpistemicMemoryClient.from_workspace(unauth_dir, enable_embeddings=False)
+                self.assertIn("escopo autorizado", str(ctx_sdk.exception))
+                self.assertEqual(os.listdir(unauth_dir), [])
+
+                with self.assertRaises(Invalid) as ctx_dossie:
+                    DossieWorkspace(unauth_dir / "sistema", unauth_dir / "cofre", enable_embeddings=False)
+                self.assertIn("escopo autorizado", str(ctx_dossie.exception))
+                self.assertEqual(os.listdir(unauth_dir), [])
+
+            # Quando autorizado explicitamente via EMC_AUTHORIZED_ROOTS, opera normalmente
+            with patch.dict(os.environ, {**clean_env, "EMC_AUTHORIZED_ROOTS": str(unauth_dir)}, clear=True):
+                authorized_client = EpistemicMemoryClient.from_workspace(
+                    unauth_dir, enable_embeddings=False
+                )
+                created = authorized_client.remember_source(
+                    "Fonte Externa Autorizada",
+                    "Conteúdo gravado após autorização explícita de escopo.",
+                    source_kind="document",
+                )
+                self.assertEqual(created["revision"], 1)
+                self.assertEqual(
+                    authorized_client.read_source(created["id"])["payload"]["content"],
+                    "Conteúdo gravado após autorização explícita de escopo.",
+                )
 
 
 if __name__ == "__main__":

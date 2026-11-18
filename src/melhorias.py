@@ -1,5 +1,5 @@
 """Ajustes delimitados com avaliação determinística, intenções retomáveis e auditoria de cadeia."""
-import array,copy,json,math,os,re,stat,sys
+import array,copy,json,math,os,re,sqlite3,stat,struct,sys,tempfile
 from pathlib import Path
 from contextlib import contextmanager
 from nucleo import Invalid,Conflict,NOW,sha,canon
@@ -11,7 +11,9 @@ KEY_PATTERN=r'[A-Za-z0-9_-]{1,80}'
 PHASES=('adopt_intent','adopt_config','adopt_candidate','adopted',
         'rollback_intent','rollback_config','rollback_candidate','rolled_back')
 ADOPTABLE_KINDS=('message_codec','retrieval_policy','vector_storage','batch_limits')
-VECTOR_STORAGE_FORMATS=('packed_f64','packed_f32','json')
+VECTOR_STORAGE_FORMATS=('packed_f64','json')
+MAX_TIE_GROUP_SIZE=64
+MAX_TIE_STEPS=5000
 BATCH_LIMIT_BOUNDS={'max_actions':(1,64),'max_model_calls':(0,16),'max_seconds':(1,3600)}
 CANDIDATE_METADATA={
     'message_codec':{
@@ -136,7 +138,8 @@ def _validated_config(raw):
     for name in ('model','embeddings'):
         if not isinstance(cfg[name],dict) or type(cfg[name].get('enabled',False)) is not bool:
             raise Invalid('configuração de provedor inválida: '+name)
-    if cfg['embeddings'].get('vector_storage','packed_f64') not in VECTOR_STORAGE_FORMATS:
+    vec_fmt=cfg['embeddings'].get('vector_storage','packed_f64')
+    if not isinstance(vec_fmt,str) or vec_fmt not in VECTOR_STORAGE_FORMATS:
         raise Invalid('formato de armazenamento vetorial desconhecido')
     if cfg['message_codec'] not in ('compact','pretty') or cfg['retrieval_policy'] not in ('hybrid','lexical'):
         raise Invalid('política de comunicação ou recuperação desconhecida')
@@ -224,23 +227,162 @@ def _score_retrieval_policy(policy,embeddings_enabled):
     }
 
 
-def _benchmark_vector(dim=384):
-    raw=[((i*73+19)%251-125)/127.0+(1.0/(i+3.0))*1e-6 for i in range(dim)]
+def _benchmark_vector(dim=384,seed=0):
+    raw=[(((i*73+19+seed*41)%251)-125)/127.0+(1.0/(i+3.0+seed))*1e-6 for i in range(dim)]
     norm=math.sqrt(sum(x*x for x in raw))
     return [x/norm for x in raw]
 
 
-def _roundtrip_vector(fmt,vector):
+def _sql_encode_vector(fmt,vector):
+    vals=[float(x) for x in vector]
     if fmt=='json':
-        encoded=canon(vector).encode('utf-8')
-        return encoded,json.loads(encoded.decode('utf-8'))
-    code='d' if fmt=='packed_f64' else 'f'
-    arr=array.array(code,vector)
-    if sys.byteorder!='little':arr.byteswap()
-    encoded=arr.tobytes()
-    out=array.array(code);out.frombytes(encoded)
-    if sys.byteorder!='little':out.byteswap()
-    return encoded,out.tolist()
+        return canon(vals)
+    if fmt=='packed_f64':
+        arr=array.array('d',vals)
+        if sys.byteorder!='little':arr.byteswap()
+        return arr.tobytes()
+    raise Invalid('formato de armazenamento vetorial desconhecido')
+
+
+def _sql_decode_vector(raw,expected_dim=None):
+    try:
+        if isinstance(raw,(bytes,bytearray,memoryview)):
+            buf=bytes(raw)
+            if not buf or len(buf)%8!=0:return None
+            arr=array.array('d');arr.frombytes(buf)
+            if sys.byteorder!='little':arr.byteswap()
+            vals=arr.tolist()
+        elif isinstance(raw,str):
+            parsed=json.loads(raw)
+            if not isinstance(parsed,list) or not parsed:return None
+            vals=[]
+            for x in parsed:
+                if type(x) not in (int,float):return None
+                vals.append(float(x))
+        else:
+            return None
+        if expected_dim is not None and len(vals)!=expected_dim:return None
+        if not all(math.isfinite(x) for x in vals):return None
+        return vals
+    except (ValueError,TypeError,OverflowError,struct.error):
+        return None
+
+
+def _evaluate_sqlite_vector_storage(previous,selected,dim=384):
+    docs=[('doc-'+str(idx),sha(('doc-'+str(idx)).encode()),_benchmark_vector(dim,seed=idx)) for idx in range(4)]
+    queries=[_benchmark_vector(dim,seed=idx) for idx in range(3)]
+    expected_prev_type='text' if previous=='json' else 'blob'
+    expected_sel_type='text' if selected=='json' else 'blob'
+    with tempfile.TemporaryDirectory(prefix='emc-sqlite-vec-') as tmp_dir:
+        db_path=Path(tmp_dir)/'recuperacao.sqlite3'
+        conn=sqlite3.connect(db_path)
+        try:
+            conn.execute('PRAGMA synchronous=OFF')
+            conn.executescript('''CREATE TABLE vectors(id TEXT,part INTEGER,digest TEXT,value TEXT,PRIMARY KEY(id,part));
+                                  CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);''')
+            with conn:
+                for doc_id,digest,vec in docs:
+                    conn.execute('INSERT INTO vectors VALUES(?,?,?,?)',(doc_id,0,digest,_sql_encode_vector(previous,vec)))
+                conn.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('vector_storage',previous))
+        finally:
+            conn.close()
+
+        conn=sqlite3.connect(db_path)
+        try:
+            prev_rows=conn.execute(
+                'SELECT id,part,digest,typeof(value),LENGTH(CAST(value AS BLOB)),value FROM vectors ORDER BY id,part'
+            ).fetchall()
+        finally:
+            conn.close()
+
+        prev_types_ok=len(prev_rows)==len(docs) and all(r[3]==expected_prev_type for r in prev_rows)
+        prev_total_bytes=sum(int(r[4]) for r in prev_rows)
+        prev_per_vec_bytes=int(prev_rows[0][4]) if prev_rows else 0
+        prev_decoded={r[0]:_sql_decode_vector(r[5],expected_dim=dim) for r in prev_rows}
+        prev_scores=[]
+        prev_rankings=[]
+        for q in queries:
+            sc={doc_id:sum(a*b for a,b in zip(prev_decoded[doc_id],q))
+                for doc_id,_,_ in docs if prev_decoded.get(doc_id) is not None}
+            prev_scores.append(sc)
+            prev_rankings.append([doc_id for doc_id in sorted(sc,key=lambda i:(-sc[i],i))])
+
+        conn=sqlite3.connect(db_path)
+        try:
+            conn.execute('PRAGMA synchronous=OFF')
+            existing=conn.execute('SELECT id,part,digest,value FROM vectors ORDER BY id,part').fetchall()
+            migrated=[]
+            for row_id,part,row_digest,raw_val in existing:
+                recovered=_sql_decode_vector(raw_val,expected_dim=dim)
+                if recovered is None:
+                    raise Invalid('falha ao recuperar vetor existente durante migração do índice')
+                migrated.append((row_id,part,row_digest,_sql_encode_vector(selected,recovered)))
+            with conn:
+                for row_id,part,row_digest,encoded_val in migrated:
+                    conn.execute('DELETE FROM vectors WHERE id=? AND part=?',(row_id,part))
+                    conn.execute('INSERT INTO vectors VALUES(?,?,?,?)',(row_id,part,row_digest,encoded_val))
+                conn.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('vector_storage',selected))
+        finally:
+            conn.close()
+
+        conn=sqlite3.connect(db_path)
+        try:
+            sel_rows=conn.execute(
+                'SELECT id,part,digest,typeof(value),LENGTH(CAST(value AS BLOB)),value FROM vectors ORDER BY id,part'
+            ).fetchall()
+            meta_row=conn.execute("SELECT value FROM metadata WHERE key='vector_storage'").fetchone()
+        finally:
+            conn.close()
+
+        sqlite_reopened_ok=(len(sel_rows)==len(docs) and meta_row==(selected,)
+                            and prev_types_ok and all(r[3]==expected_sel_type for r in sel_rows))
+        sel_total_bytes=sum(int(r[4]) for r in sel_rows)
+        sel_per_vec_bytes=int(sel_rows[0][4]) if sel_rows else 0
+        sel_decoded={r[0]:_sql_decode_vector(r[5],expected_dim=dim) for r in sel_rows}
+        dim_ok=len(sel_decoded)==len(docs) and all(v is not None and len(v)==dim for v in sel_decoded.values())
+        finite_ok=dim_ok and all(type(x) in (int,float) and math.isfinite(x) for v in sel_decoded.values() for x in v)
+        lossless_ok=dim_ok and all(sel_decoded[doc_id]==vec and prev_decoded.get(doc_id)==vec for doc_id,_,vec in docs)
+        cosine_ok=dim_ok and finite_ok and all(
+            abs(sum(a*b for a,b in zip(vec,sel_decoded[doc_id]))-1.0)<=1e-12 for doc_id,_,vec in docs
+        )
+        sel_scores=[]
+        sel_rankings=[]
+        for q in queries:
+            sc={doc_id:sum(a*b for a,b in zip(sel_decoded[doc_id],q))
+                for doc_id,_,_ in docs if sel_decoded.get(doc_id) is not None}
+            sel_scores.append(sc)
+            sel_rankings.append([doc_id for doc_id in sorted(sc,key=lambda i:(-sc[i],i))])
+        ranking_ok=(dim_ok and sel_rankings==prev_rankings and all(
+            abs(sel_scores[qi][doc_id]-prev_scores[qi][doc_id])<=1e-12
+            for qi in range(len(queries)) for doc_id,_,_ in docs
+        ))
+        eligible=bool(selected!=previous and sqlite_reopened_ok and dim_ok and finite_ok
+                      and lossless_ok and cosine_ok and ranking_ok and sel_total_bytes<prev_total_bytes)
+        return {
+            'eligible':eligible,
+            'checks':{
+                'supported_by_index':True,
+                'dimension_preserved':dim_ok,
+                'all_finite':finite_ok,
+                'lossless_roundtrip':lossless_ok,
+                'cosine_preserved':cosine_ok,
+                'sqlite_reopened_verified':sqlite_reopened_ok,
+                'search_ranking_preserved':ranking_ok,
+                'permissions_unchanged':True,
+            },
+            'comparison':{
+                'previous':previous,
+                'selected':selected,
+                'records_indexed':len(docs),
+                'dimensions':dim,
+                'previous_sqlite_type':expected_prev_type,
+                'selected_sqlite_type':expected_sel_type,
+                'previous_bytes_per_vector':prev_per_vec_bytes,
+                'selected_bytes_per_vector':sel_per_vec_bytes,
+                'previous_bytes':prev_total_bytes,
+                'selected_bytes':sel_total_bytes,
+            },
+        }
 
 
 def _batch_workloads(model_calls):
@@ -291,23 +433,23 @@ def _measure(candidate,current):
                           'previous_channels':prev_m['configured_channels'],'selected_channels':sel_m['configured_channels']},
             'scope':'Benchmark determinístico RRF local; não substitui avaliação em consultas reais do usuário.',
             'previous_config_hash':config_hash}
-    if kind=='vector_storage' and value in VECTOR_STORAGE_FORMATS:
-        previous=cfg['embeddings'].get('vector_storage','packed_f64');selected=value
-        vector=_benchmark_vector(384)
-        prev_bytes,_=_roundtrip_vector(previous,vector)
-        sel_bytes,sel_decoded=_roundtrip_vector(selected,vector)
-        dim_ok=len(sel_decoded)==len(vector)
-        finite_ok=all(type(x) in (int,float) and math.isfinite(x) for x in sel_decoded)
-        lossless_ok=dim_ok and sel_decoded==vector
-        cosine_ok=dim_ok and finite_ok and abs(sum(a*b for a,b in zip(vector,sel_decoded))-1.0)<=1e-12
-        eligible=bool(dim_ok and finite_ok and lossless_ok and cosine_ok and len(sel_bytes)<len(prev_bytes))
-        return {'status':'completed','candidate':candidate,'eligible':eligible,
-            'checks':{'dimension_preserved':dim_ok,'all_finite':finite_ok,
-                      'lossless_roundtrip':lossless_ok,'cosine_preserved':cosine_ok,
-                      'permissions_unchanged':True},
-            'comparison':{'previous':previous,'selected':selected,'dimensions':len(vector),
-                          'previous_bytes':len(prev_bytes),'selected_bytes':len(sel_bytes)},
-            'scope':'Vetor IEEE-754 local de 384 dimensões; não habilita embeddings nem altera modelo.',
+    if kind=='vector_storage' and isinstance(value,str):
+        previous=cfg['embeddings'].get('vector_storage','packed_f64')
+        if value not in VECTOR_STORAGE_FORMATS:
+            return {'status':'completed','candidate':candidate,'eligible':False,
+                'checks':{'supported_by_index':False,'dimension_preserved':False,'all_finite':False,
+                          'lossless_roundtrip':False,'cosine_preserved':False,
+                          'sqlite_reopened_verified':False,'search_ranking_preserved':False,
+                          'permissions_unchanged':True},
+                'comparison':{'previous':previous,'selected':value,'supported_formats':list(VECTOR_STORAGE_FORMATS)},
+                'reason':'Formato vetorial não implementado ou com perda de precisão no índice SQLite.',
+                'scope':'Índice SQLite real de vetores locais; apenas json e packed_f64 são aceitos.',
+                'previous_config_hash':config_hash}
+        measured=_evaluate_sqlite_vector_storage(previous,value,dim=384)
+        return {'status':'completed','candidate':candidate,'eligible':measured['eligible'],
+            'checks':measured['checks'],
+            'comparison':measured['comparison'],
+            'scope':'Índice SQLite real reaberto em disco com 4 registros de 384 dimensões; não habilita embeddings nem altera modelo.',
             'previous_config_hash':config_hash}
     if kind=='batch_limits' and _valid_batch_limits_value(value):
         prev_limits={name:cfg[name] for name in ('max_actions','max_model_calls','max_seconds')}
@@ -581,6 +723,95 @@ def rollback(sources,key):
         return state
 
 
+def _bucket_structurally_feasible(bucket,start_hash,prior_used_ids):
+    bucket_ids={ev['id'] for ev in bucket}
+    b_out={};b_in={};b_nodes=set();adj={}
+    for ev in bucket:
+        dep=ev['depends_on']
+        if dep is not None and dep not in prior_used_ids and dep not in bucket_ids:
+            return False,None
+        u,v=ev['before_hash'],ev['after_hash']
+        b_nodes.add(u);b_nodes.add(v)
+        b_out[u]=b_out.get(u,0)+1
+        b_in[v]=b_in.get(v,0)+1
+        adj.setdefault(u,set()).add(v)
+    if start_hash not in b_nodes or b_out.get(start_hash,0)<1:
+        return False,None
+    plus=[n for n in b_nodes if b_out.get(n,0)-b_in.get(n,0)==1]
+    minus=[n for n in b_nodes if b_in.get(n,0)-b_out.get(n,0)==1]
+    if any(abs(b_out.get(n,0)-b_in.get(n,0))>1 for n in b_nodes) or len(plus)!=len(minus) or len(plus)>1:
+        return False,None
+    if len(plus)==1:
+        if plus[0]!=start_hash:return False,None
+        expected_end=minus[0]
+    else:
+        expected_end=start_hash
+    visited={start_hash};queue=[start_hash];q_pos=0
+    while q_pos<len(queue):
+        curr=queue[q_pos];q_pos+=1
+        for nxt in adj.get(curr,()):
+            if nxt not in visited:
+                visited.add(nxt);queue.append(nxt)
+    if any(ev['before_hash'] not in visited for ev in bucket):
+        return False,None
+    return True,expected_end
+
+
+def _solve_bucket_iteratively(bucket,start_hash,prior_used_ids):
+    m=len(bucket)
+    if m==1:
+        ev=bucket[0]
+        if ev['before_hash']!=start_hash:return 'broken',None,None,None
+        if ev['depends_on'] is not None and ev['depends_on'] not in prior_used_ids:return 'broken',None,None,None
+        return 'valid',[ev],ev['after_hash'],(prior_used_ids|{ev['id']})
+    feasible,expected_end=_bucket_structurally_feasible(bucket,start_hash,prior_used_ids)
+    if not feasible:
+        return 'broken',None,None,None
+    if m>MAX_TIE_GROUP_SIZE:
+        return 'inconclusive',None,expected_end,None
+    id_to_local={ev['id']:idx for idx,ev in enumerate(bucket)}
+    local_dep_bit=[]
+    for ev in bucket:
+        dep=ev['depends_on']
+        if dep is None or dep in prior_used_ids:local_dep_bit.append(0)
+        else:local_dep_bit.append(1<<id_to_local[dep])
+    by_before={}
+    for idx,ev in enumerate(bucket):
+        by_before.setdefault(ev['before_hash'],[]).append(idx)
+    full_mask=(1<<m)-1
+    first_cands=[idx for idx in by_before.get(start_hash,()) if not local_dep_bit[idx]]
+    stack=[[start_hash,0,0,first_cands,-1]]
+    chosen_indices=[]
+    steps=0
+    while stack:
+        steps+=1
+        if steps>MAX_TIE_STEPS:
+            return 'inconclusive',None,expected_end,None
+        frame=stack[-1]
+        cur_node,used_mask,cursor,cands,_=frame
+        if used_mask==full_mask:
+            seq=[bucket[idx] for idx in chosen_indices]
+            return 'valid',seq,cur_node,(prior_used_ids|{ev['id'] for ev in bucket})
+        if cursor>=len(cands):
+            popped=stack.pop()
+            if popped[4]>=0:chosen_indices.pop()
+            continue
+        pick_idx=cands[cursor]
+        frame[2]=cursor+1
+        next_mask=used_mask|(1<<pick_idx)
+        next_node=bucket[pick_idx]['after_hash']
+        chosen_indices.append(pick_idx)
+        if next_mask==full_mask:
+            seq=[bucket[idx] for idx in chosen_indices]
+            return 'valid',seq,next_node,(prior_used_ids|{ev['id'] for ev in bucket})
+        next_cands=[
+            idx for idx in by_before.get(next_node,())
+            if not (next_mask&(1<<idx)) and (not local_dep_bit[idx] or (next_mask&local_dep_bit[idx]))
+        ]
+        stack.append([next_node,next_mask,0,next_cands,pick_idx])
+    return 'broken',None,None,None
+
+
 def _solve_transition_chain(completed_entries):
     events=[]
     for entry in completed_entries:
@@ -631,24 +862,42 @@ def _solve_transition_chain(completed_entries):
         buckets=[[ev for ev in ordered_hints if ev['at']==ts] for ts in timestamps]
         initial_candidates=starts if len(starts)==1 else list(dict.fromkeys(
             ev['before_hash'] for ev in buckets[0] if ev['depends_on'] is None))
-        budget=[5000]
-        def walk_bucket(b_idx,remaining,cur_hash,used_ids,acc):
-            if budget[0]<=0:return None
-            budget[0]-=1
-            if not remaining:
-                if b_idx+1==len(buckets):return acc
-                return walk_bucket(b_idx+1,buckets[b_idx+1],cur_hash,used_ids,acc)
-            for pos,ev in enumerate(remaining):
-                if ev['before_hash']!=cur_hash:continue
-                if ev['depends_on'] is not None and ev['depends_on'] not in used_ids:continue
-                nxt=remaining[:pos]+remaining[pos+1:]
-                found=walk_bucket(b_idx,nxt,ev['after_hash'],used_ids|{ev['id']},acc+[ev])
-                if found is not None:return found
-            return None
+        inconclusive_issue=None
         for start_hash in initial_candidates:
-            solution=walk_bucket(0,buckets[0],start_hash,set(),[])
-            if solution is not None:
-                return solution,None
+            cur_hash=start_hash
+            used_ids=set()
+            acc=[]
+            candidate_status='valid'
+            first_inconclusive=None
+            for b_idx,bucket in enumerate(buckets):
+                b_status,seq,next_hash,next_used=_solve_bucket_iteratively(bucket,cur_hash,used_ids)
+                if b_status=='broken':
+                    candidate_status='broken'
+                    break
+                if b_status=='inconclusive':
+                    candidate_status='inconclusive'
+                    if first_inconclusive is None:
+                        first_inconclusive={
+                            'code':'inconclusive_chain',
+                            'key':bucket[0]['key'],
+                            'timestamp':timestamps[b_idx],
+                            'tie_group_size':len(bucket),
+                            'max_tie_group_size':MAX_TIE_GROUP_SIZE,
+                            'max_tie_steps':MAX_TIE_STEPS,
+                            'detail':'Grupo de eventos no mesmo instante excedeu o limite explícito de desempate combinatório sem violar graus estruturais.',
+                        }
+                    cur_hash=next_hash
+                    used_ids=used_ids|{ev['id'] for ev in bucket}
+                else:
+                    acc.extend(seq)
+                    cur_hash=next_hash
+                    used_ids=next_used
+            if candidate_status=='valid':
+                return acc,None
+            if candidate_status=='inconclusive' and inconclusive_issue is None:
+                inconclusive_issue=first_inconclusive
+        if inconclusive_issue is not None:
+            return None,inconclusive_issue
     # Localiza o primeiro ponto observável de ruptura para diagnóstico determinístico.
     gap={'code':'broken_chain','key':ordered_hints[0]['key'],
          'detail':'Cadeia histórica de adoções apresenta lacuna ou edição externa intermediária.'}
@@ -751,15 +1000,17 @@ def audit_adoption_chain(sources):
     structural_clean=all(e['valid'] and e['status'] in ('adopted','rolled_back') for e in entries) and not any(
         i['code']=='duplicate_candidate_journal' for i in issues)
     expected_config_hash=None;config_matches_chain=config_valid;external_drift=False;drifted_keys=[]
-    chain_public=[];chain_valid=False
+    chain_public=[];chain_valid=False;chain_status='valid' if not entries else 'broken'
     if structural_clean:
         completed=[e for e in entries if e['valid'] and e['status'] in ('adopted','rolled_back')]
         walk,gap=_solve_transition_chain(completed)
         if gap is not None:
             issues.append(gap)
             config_matches_chain=False
+            chain_status='inconclusive' if gap.get('code')=='inconclusive_chain' else 'broken'
         else:
             chain_valid=True
+            chain_status='valid'
             chain_public=[{name:ev[name] for name in ('key','action','kind','candidate_id','at','before_hash','after_hash')}
                           for ev in walk]
             if walk:
@@ -789,6 +1040,7 @@ def audit_adoption_chain(sources):
         'external_drift':external_drift,
         'drifted_keys':drifted_keys,
         'chain_valid':chain_valid,
+        'chain_status':chain_status,
         'journal_count':len(entries),
         'counts_by_status':counts_by_status,
         'active_intent':active_intent,

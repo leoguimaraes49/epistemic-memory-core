@@ -87,9 +87,12 @@ class Coordinator:
     def __init__(self,root,capabilities=None,authorize=lambda:True,context_token=lambda:'fixture',clock=time.time,
                  origin_validator=None):
         self.root=Path(root).resolve()
-        from nucleo import REAL_SYSTEM,Invalid
+        from nucleo import REAL_SYSTEM,Invalid,_authorized_env_roots
         valid=(self.root==REAL_SYSTEM/'estado'/'coordenacao' or
                self.root.is_relative_to(REAL_SYSTEM/'testes_temporarios'))
+        if not valid:
+            for base in _authorized_env_roots():
+                if self.root==base or base in self.root.parents:valid=True;break
         if not valid:raise ContractError('estado da coordenação fora do serviço autorizado')
         self.root.mkdir(parents=True,exist_ok=True)
         self.db=self.root/'coordenacao.sqlite3'

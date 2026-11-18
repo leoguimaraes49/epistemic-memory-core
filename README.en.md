@@ -1,170 +1,103 @@
-# Epistemic Memory Core — Universal Governed Memory Protocol for AI Agents
+# Epistemic Memory Core — Local-First Governed Memory Protocol
 
-> **Local-first transactional memory, premise governance, deterministic claim verification, and self-healing hybrid search engine for AI assistants and multi-agent pipelines — accessible via MCP, in-process Python SDK, REST HTTP Gateway, and Obsidian.**
+> **Deterministic transactional memory, premise governance, standard-library claim verification, and self-healing local hybrid search over SQLite + Markdown — usable directly via CLI and local web workbenches, or optionally connected to AI agents via MCP, Python SDK, and REST HTTP Gateway.**
 
-🇧🇷 [Leia em Português](README.md) · 🏛️ [Epistemic Dossier Studio](apps/dossie_studio/README.md) · 🧠 [Agent Memory SDK](apps/agent_memory_sdk/README.md) · 🕸️ [HTTP Gateway & Lineage UI](apps/http_gateway/README.md) · 📖 [Formal Architecture Manual (17 Chapters, PT-BR)](00_Manual/indice-manual-cerebro.md)
+🇧🇷 [Leia em Português](README.md) · [Epistemic Dossier Studio](apps/dossie_studio/README.md) · [Agent Memory SDK](apps/agent_memory_sdk/README.md) · [HTTP Gateway](apps/http_gateway/README.md) · [Normative Manual (17 Chapters, PT-BR)](00_Manual/indice-manual-cerebro.md) · [Detailed Architecture (PT-BR)](docs/guias/ARQUITETURA.md)
 
 [![CI](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml/badge.svg)](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml)
 [![Python 3.11 | 3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
-[![Protocol](https://img.shields.io/badge/protocol-MCP%201.26%20%7C%20SDK%20%7C%20REST-purple.svg)](https://modelcontextprotocol.io/)
-[![Embeddings](https://img.shields.io/badge/embeddings-E5--multilingual%20(ONNX%20Local)-green.svg)](https://github.com/microsoft/onnxruntime)
-[![Storage](https://img.shields.io/badge/storage-SQLite%20%2B%20Markdown-orange.svg)](https://obsidian.md/)
-[![Tests](https://img.shields.io/badge/tests-27%20suites-blue.svg)](#automated-test-suites-27-official-suites)
-[![Version](https://img.shields.io/badge/version-v0.5.8-blueviolet.svg)](https://github.com/leoguimaraes49/epistemic-memory-core/releases/tag/v0.5.8)
+[![MCP 1.26](https://img.shields.io/badge/protocol-MCP%201.26%20%7C%20SDK%20%7C%20REST-purple.svg)](https://modelcontextprotocol.io/)
+[![ONNX Local](https://img.shields.io/badge/embeddings-E5--multilingual%20(ONNX%20Local)-green.svg)](https://github.com/microsoft/onnxruntime)
+[![SQLite + Markdown](https://img.shields.io/badge/storage-SQLite%20%2B%20Markdown-orange.svg)](https://obsidian.md/)
+[![28 suites](https://img.shields.io/badge/tests-28%20suites-blue.svg)](#local-vector-search-and-28-automated-test-suites)
+[![v0.5.9](https://img.shields.io/badge/version-v0.5.9-blueviolet.svg)](https://github.com/leoguimaraes49/epistemic-memory-core/releases/tag/v0.5.9)
 
 ![Architecture Overview](docs/architecture-en.jpg)
 
----
-
-## Why Epistemic Memory Core?
-
-Giving LLM agents direct write access to raw Markdown notes or flat vector databases breaks down in four predictable ways:
-
-1. **Premise Drift Without Invalidation:** When a primary source (a vendor quote, contract clause, or user report) changes, downstream summaries and conclusions keep getting retrieved as if their underlying basis were still valid.
-2. **Misattribution:** In multi-speaker notes or external documents, agents routinely bind a quote, pronoun, or numeric metric from Person B onto Person A's profile.
-3. **Dirty Reads & Torn Writes:** Crashing or racing between writing a `.md` file and committing metadata exposes unconfirmed or truncated files to readers or creates duplicate records on retry.
-4. **Silent Blending of Fact and Inference:** Raw observations, screening scores, and AI-generated hypotheses get flattened into indistinguishable prose.
-
-**Epistemic Memory Core** enforces deterministic rules in Python before data hits disk: immutable `UUIDv4` identities, revision chains, raw-byte `SHA-256` digests, strict separation between **primary sources** (`30_Fontes`) and **derived knowledge**, OS-level concurrency locks held across SQLite commits, deterministic upstream/downstream lineage introspection (`Knowledge.lineage`), cascade *stale-on-write* invalidation, a 4-class bounded self-evolution lab, and a zero-LLM standard-library claim verifier (`lab-assurance-2`).
+> For scenario-specific Mermaid flowcharts, the end-to-end transactional sequence diagram, the 25-module `src/` reference table, and the 17-chapter normative index, see [`docs/guias/ARQUITETURA.md`](docs/guias/ARQUITETURA.md).
 
 ---
 
-## System Architecture
+## What the Engine Solves
 
-```mermaid
-flowchart TD
-    subgraph Clients ["1. AI Clients & Multi-Agent Consumers"]
-        direction LR
-        MCPClients["MCP Assistants (Claude Code / Codex / Antigravity)"]
-        PyPipelines["Python Agent Loops (LangGraph / OpenAI / Gemini)"]
-        PolyglotSvc["Polyglot Microservices (Node.js / Go / Rust / C#)"]
-    end
-
-    subgraph Adapters ["2. Governed Access Surfaces"]
-        direction LR
-        MCPServer["src/ponte_pessoal.py (33 MCP Tools) + src/cli.py"]
-        AgentSDK["apps/agent_memory_sdk (In-Process Client + Tool Schemas)"]
-        RestGW["apps/http_gateway (:8095 REST v1 + Live SVG Lineage UI)"]
-        DossierApp["apps/dossie_studio (:8090 Audit Workbench)"]
-    end
-
-    subgraph Governance ["3. Deterministic Firewall & Verification"]
-        direction LR
-        AttrFW["Attribution Firewall (src/atribuicao.py)"]
-        ClaimVer["RFC-6901 Claim Verifier (src/verificador_evidencias.py)"]
-        LinGraph["Lineage & Blast Radius (Knowledge.lineage)"]
-    end
-
-    subgraph Engine ["4. ACID Storage, Self-Healing Hybrid Search & Evolution Lab"]
-        direction LR
-        ACID["OS File Locks + SQLite Ledger + NFC Sanitizer (src/nucleo.py)"]
-        HybridRRF["RRF + ONNX E5 Self-Healing Vectors (src/recuperacao.py)"]
-        SelfEvo["4-Class Deterministic Evolution Lab (src/melhorias.py)"]
-    end
-
-    MCPClients <-->|"MCP stdio"| MCPServer
-    PyPipelines --> AgentSDK
-    PolyglotSvc -->|"Bearer Auth + JSON"| RestGW
-    MCPServer --> Governance
-    AgentSDK --> Governance
-    RestGW --> Governance
-    DossierApp --> Governance
-    Governance --> Engine
-```
+1. **Premise Drift Without Invalidation:** When a primary source (`30_Fontes`) is rectified or excluded, dependent assertions, syntheses, scores, and receipts automatically transition to review (*stale-on-write*), preserving full revision chains and deterministic blast-radius inspection (`Knowledge.lineage`).
+2. **Cross-Speaker Misattribution:** The deterministic attribution firewall (`src/atribuicao.py`) validates person entities, aliases, pronouns, numeric metrics, and literal quotes before committing assertions — blocking cross-speaker swaps and first-person leakage from external documents.
+3. **Dirty Reads, Torn Writes & Replay Drift:** Every mutation requires an idempotency `operation_key`, stages proposals in SQLite (`PRAGMA synchronous=FULL`), holds exclusive OS file locks across `fsync` and `COMMIT`, and binds an immutable historical operation receipt to that key — strictly separating historical revision proof from live `current_state` queries across restarts.
+4. **Blending of Evidence and Inference:** Immutable primary sources (`30_Fontes`) stay physically separated from derived knowledge (`10_Entidades`, `20_Afirmacoes`, `50_Sinteses`), paired with a zero-LLM Python standard-library claim verifier (`lab-assurance-2`: RFC-6901 `field`, strict integer `sum`, and acyclic `chain`).
 
 ---
 
-## Key Engineering Guarantees
+## Included Ecosystem (100% Functional Without Mandatory AI)
 
-- **Transactional Proposal & Confirmation (`src/nucleo.py`, `src/conhecimento.py`):** Every write requires an idempotency `operation_key`. The engine stages proposals in SQLite (`PRAGMA synchronous=FULL`), reserves NFC-normalized filenames atomically (blocking Windows device stems, control/BiDi spoofing characters, and null bytes), holds exclusive OS file locks (`CreateFileW dwShareMode=0` on Windows; `flock` + `pread`/`fstat` verification on Linux & macOS) across `fsync` and SQLite `COMMIT`, and blocks truncated or unconfirmed files from catalog reads (*anti-dirty-read*).
-- **Deterministic Lineage & Blast-Radius Introspection (`Knowledge.lineage` / CLI `linhagem`):** Cycle-safe BFS + 3-color DFS graph introspection returning target integrity, direct & transitive upstream bases (`30_Fontes` and intermediate records with `pinned_revision` vs. `current_revision` and `SHA-256` validity), and downstream dependents grouped into `active` vs. `suspended`.
-- **Strict Attribution Firewall (`src/atribuicao.py`):** Cross-checks person entities, aliases, homonyms, pronouns, and literal quotes before recording personal or third-party assertions — blocking cross-speaker swaps and external-document first-person leakage.
-- **Zero-LLM Deterministic Claim Verifier (`src/verificador_evidencias.py`, `src/evidencias.py`):** Pure Python stdlib verifier checking strict RFC-6901 JSON pointers (`field`), exact integer sums (`sum`, rejecting `bool` smuggling and overflow), and acyclic transitive chains (`chain`), issuing `lab-assurance-2` receipts that automatically turn `stale` when the vault generation advances.
-- **Self-Healing Local Hybrid Search (`src/recuperacao.py`):** Combines lexical matching, local `intfloat/multilingual-e5-small` ONNX embeddings (packed `float64` SQLite `BLOB`s + vectorized NumPy scoring), and graph expansion via Reciprocal Rank Fusion (RRF) — automatically detecting and re-indexing truncated, `NaN`/`Inf`, or dimension-mismatched vector blobs without crashing search.
-- **4-Class Deterministic Self-Evolution Lab (`src/melhorias.py`):** AST-sandboxed evaluator supporting reproducible benchmarking, atomic adoption, LIFO rollback, and cryptographic chain auditing (`audit_adoption_chain()`, `diagnostics_summary()`) across `message_codec`, `retrieval_policy`, `vector_storage`, and `batch_limits` while strictly prohibiting privilege or model-budget escalation.
-
----
-
-## Universal Adapters & Included Applications (`apps/`)
-
-### 1. Epistemic Agent Memory SDK (`apps/agent_memory_sdk/`)
-In-process Python SDK and LLM Function-Calling adapter for **LangGraph**, **OpenAI Agents**, **Google Gemini SDK**, and custom multi-agent pipelines without requiring MCP `stdio`:
-- Typed governed methods: `make_operation_key()`, `remember_source()`, `rectify_source()`, `register_entity()`, `assert_fact()`, `synthesize()`, `prepare_decision()`, `verify_claims()`, `recall_context()`, and `blast_radius()`.
-- Ready-to-use tool schemas (`as_openai_tools(strict=True)`, `as_gemini_declarations()`) and `dispatch_tool_call(name, arguments)` returning structured JSON with deterministic error codes (`ATTRIBUTION_FIREWALL_BLOCKED`, `REVISION_CONFLICT`, `VALIDATION_ERROR`, etc.).
+| Component | Role & Access Surface | AI Requirement |
+| :--- | :--- | :--- |
+| [`src/`](src/) ([Architecture](docs/guias/ARQUITETURA.md)) | **Core Engine, MCP Server (`ponte_pessoal.py`, 33 tools), CLI (`emc` / `linhagem`), Dashboard (`:8080`) & Evolution Lab (`melhorias.py`):** ACID storage, hybrid RRF search, and 4-class deterministic optimization. | **None** (MCP optional) |
+| [`apps/dossie_studio/`](apps/dossie_studio/README.md) | **Epistemic Dossier Studio (`emc-dossie`, `:8090`):** local web workbench and CLI for auditing engineering quotes, legal contracts, and research protocols with *stale-on-write* simulation. | **None** |
+| [`apps/agent_memory_sdk/`](apps/agent_memory_sdk/README.md) | **Agent Memory SDK (`in-process`):** typed Python client with immutable historical receipts per `operation_key`, isolated disposable demo cleanup, and optional OpenAI/Gemini/LangGraph tool schemas. | **Optional** (on-demand tool calling) |
+| [`apps/http_gateway/`](apps/http_gateway/README.md) | **HTTP Gateway & SVG Graph (`emc-gateway`, `:8095`):** polyglot REST JSON v1 server + interactive SVG Lineage Explorer with `read_only` UI bootstrap sessions and `read_write` operator `Bearer` tokens. | **None** |
 
 ```bash
+# Launch interactive Dossier Studio (presets: engenharia_cotacao, juridico_contrato, pesquisa_decisao)
+./.venv/bin/python apps/dossie_studio/cli.py --workspace ./testes_temporarios/dossier serve --preload engenharia_cotacao
+
+# Run multi-agent Python SDK demo (creates and cleans up only its own disposable child directory)
 ./.venv/bin/python apps/agent_memory_sdk/cli_demo.py --workspace ./testes_temporarios/sdk-demo --cleanup
-```
 
-### 2. Epistemic HTTP Gateway & Live Lineage Graph Explorer (`apps/http_gateway/`)
-Hardened pure-stdlib `ThreadingHTTPServer` (`127.0.0.1:8095`) exposing governed epistemic memory over REST JSON v1 (`/api/v1/health`, `/api/v1/graph`, `/api/v1/lineage/<id>`, `/api/v1/sources`, `/api/v1/sources/rectify`, `/api/v1/knowledge`, `/api/v1/verify-claims`, `/api/v1/search`) for **Node.js, Go, Rust, C#, and webhooks**, paired with a zero-dependency interactive **SVG Knowledge Graph & Blast-Radius Inspector** at `GET /`:
-- Enforces loopback binding, strict `Host` DNS-rebinding protection (`HTTP 403`), constant-time `hmac.compare_digest` Bearer authentication (`HTTP 401`), `64 KB` body cap (`HTTP 413`), `Content-Security-Policy`, and XSS escaping.
-
-```bash
-CEREBRO_PESSOAL_ACESSO=permitido ./.venv/bin/python apps/http_gateway/cli.py --workspace ./testes_temporarios/gw-demo serve --port 8095 --seed-demo
-# Open http://127.0.0.1:8095 (or run `emc-gateway` after editable install)
-```
-
-### 3. Epistemic Dossier Studio (`apps/dossie_studio/`)
-Interactive local audit workbench (`127.0.0.1:8090`) and CLI with three 1-click scenarios (*Engineering & Cloud GPU RFQ*, *Legal MSA & Addenda*, and *Applied Research Protocol with Reverse-Scored Items*):
-
-```bash
-./.venv/bin/python apps/dossie_studio/cli.py --workspace ./my-dossier serve --preload engenharia_cotacao
-# Open http://127.0.0.1:8090 (or run `emc-dossie` after editable install)
+# Start REST v1 Gateway + SVG Lineage Explorer at http://127.0.0.1:8095 and inspect lineage via CLI
+./.venv/bin/python apps/http_gateway/cli.py --workspace ./testes_temporarios/gw-demo serve --port 8095 --seed-demo
+./.venv/bin/python src/cli.py linhagem <RECORD_ID>
 ```
 
 ---
 
-## Repository Layout
+## Getting Started (Editable Clone vs. Standalone Wheel + Scope Authorization)
 
-```text
-├── 00_Manual/                   # Formal 17-chapter normative specification (SHA-256 manifest protected)
-├── apps/
-│   ├── agent_memory_sdk/        # In-process Python SDK + OpenAI/Gemini tool-calling adapter
-│   ├── dossie_studio/           # Interactive decision/contract audit workbench (:8090) + CLI
-│   └── http_gateway/            # REST JSON v1 gateway (:8095) + interactive SVG Lineage Explorer
-├── config/                      # Runtime & queue manifests (autonomia.json, execucao.json, manual_manifest.json)
-├── docs/                        # Architecture diagrams (arquitetura.jpg, architecture-en.jpg) & guides
-├── scripts/                     # Vault initializer, scale benchmark & 6-worker chaos stress harness
-│   ├── benchmark_escala.py
-│   ├── stress_caos_concorrencia.py
-│   ├── iniciar-template.py
-│   └── iniciar-trabalhador.ps1
-├── src/                         # Core transactional & epistemological engine (24 Python modules)
-├── tests/                       # 27 official automated test suites + 2 MCP regression scripts
-└── pyproject.toml               # v0.5.8 package metadata & 6 CLI entrypoints (emc, emc-mcp, emc-dashboard, emc-verifier, emc-dossie, emc-gateway)
-```
-
----
-
-## Quickstart
-
-### 1. Clone & Install (Python 3.11 or 3.12)
+### 1. Install (Python 3.11 or 3.12 — Linux, macOS, and Windows)
 
 ```bash
 git clone https://github.com/leoguimaraes49/epistemic-memory-core.git
 cd epistemic-memory-core
-
 python3 -m venv .venv
 ./.venv/bin/python -m pip install -r requirements-execucao04.txt
-# Optional editable install (exposes emc, emc-mcp, emc-dashboard, emc-verifier, emc-dossie, emc-gateway):
+
+# Option A — Editable clone setup (exposes emc, emc-mcp, emc-dashboard, emc-verifier, emc-dossie, emc-gateway):
 ./.venv/bin/python -m pip install --no-deps -e .
+
+# Option B — Standalone Wheel install (bundles 00_Manual/*.md and config/*.json in emc_resources to run outside the clone):
+./.venv/bin/python -m pip install --no-deps .
 ```
 
-*(On Windows PowerShell, use `.\.venv\Scripts\python.exe`.)*
+*(On Windows PowerShell, replace `./.venv/bin/python` with `.\.venv\Scripts\python.exe`.)*
 
-### 2. Initialize a Clean Obsidian Vault, Inspect Lineage & Launch Dashboard
+### 2. Workspace Scope Authorization (`EMC_SYSTEM`, `EMC_VAULT`, `EMC_AUTHORIZED_ROOTS`)
+`nucleo.is_authorized_scope` validates workspace paths **before** creating any directory or SQLite file. By default, only the configured primary pair (`EMC_SYSTEM` + `EMC_VAULT`) and disposable paths under `testes_temporarios/` are permitted; unauthorized directories raise `Invalid("raiz fora do escopo autorizado")` while leaving empty target folders untouched.
+
+To operate outside the git clone (for instance, from an installed `.whl` in a separate project), explicitly authorize the external root via **`EMC_AUTHORIZED_ROOTS`** (separated by `:` on Linux/macOS or `;` on Windows) or set `EMC_SYSTEM` and `EMC_VAULT`:
 
 ```bash
-./.venv/bin/python scripts/iniciar-template.py --destino ./meu-cofre --nome "My Vault"
-./.venv/bin/python src/dashboard.py
-# Operational Dashboard at http://127.0.0.1:8080
-# Inspect upstream/downstream lineage of any record from CLI:
-./.venv/bin/python src/cli.py linhagem <RECORD_ID>
+# Running outside the git clone from an installed wheel (emc, emc-gateway, emc-dossie, or Python SDK):
+export CEREBRO_PESSOAL_ACESSO="permitido"
+export EMC_AUTHORIZED_ROOTS="/srv/external-emc-workspaces"
+export EMC_GATEWAY_TOKEN="local-operator-secret-token"
+
+emc-gateway --workspace "/srv/external-emc-workspaces/audit-run" serve --port 8095 --seed-demo
 ```
 
-### 3. Connect Your AI Assistant via MCP (33 Tools)
+To initialize a clean Obsidian vault inside the clone:
+```bash
+./.venv/bin/python scripts/iniciar-template.py --destino ./meu-cofre --nome "My Vault"
+./.venv/bin/python src/dashboard.py   # Local operational dashboard at http://127.0.0.1:8080
+```
 
+### 3. HTTP Gateway Local Trust Boundary (`read_only` vs. `read_write`)
+On shared machines or multi-agent sandboxes with mixed trust levels, loopback binding (`127.0.0.1:8095`) strictly separates visual graph inspection from mutations:
+
+| Credential | Scope | Permitted Operations | Behavior on Mutating `POST` Endpoints |
+| :--- | :--- | :--- | :--- |
+| `ui_session_token` (bootstrapped via `GET /`) | `read_only` | `GET /api/v1/health`, `/api/v1/graph`, `/api/v1/lineage/<id>`, and non-mutating search | Rejected with **`HTTP 403`** (`insufficient_scope`) on `/sources`, `/sources/rectify`, `/knowledge`, and `/verify-claims` |
+| Operator Token (`--api-token` / `EMC_GATEWAY_TOKEN`) | `read_write` | Full read access + source creation, rectification, knowledge writes, and `lab-assurance-2` claim receipts | Authorized via constant-time `Authorization: Bearer <token>` or unlocked in-memory in the UI header |
+
+### 4. Optional MCP Assistant Configuration (33 Tools)
 ```json
 {
   "mcpServers": {
@@ -176,33 +109,53 @@ python3 -m venv .venv
   }
 }
 ```
+See also the operational guides (PT-BR): [Execution 0.2](docs/guias/EXECUCAO.md), [Autonomy 0.3](docs/guias/AUTONOMIA.md), and [Integrated Execution 0.4](docs/guias/EXECUCAO-INTEGRADA.md).
 
 ---
 
-## Automated Test Suites (27 Official Suites)
+## Lean Repository Layout
 
-The engine and all adapters are validated by **27 automated suites** in [`tests/`](tests/) running on GitHub Actions across **Ubuntu 24.04 (Python 3.11 & 3.12)**, **macOS 15 Apple Silicon (Python 3.12)**, and **Windows Server 2022 (Python 3.12)**.
+```text
+├── 00_Manual/                   # Immutable 17-chapter normative specification (SHA-256 manifest protected)
+├── apps/                        # Applications and adapters built over canonical engine contracts
+│   ├── agent_memory_sdk/        # In-process Python SDK + optional Function Calling (OpenAI, Gemini, LangGraph)
+│   ├── dossie_studio/           # Web workbench (:8090) + CLI for engineering, legal & research audits
+│   └── http_gateway/            # REST JSON v1 gateway (:8095) + SVG Explorer (read_only UI / read_write Bearer)
+├── config/                      # Runtime & queue manifests (manual_manifest.json, execucao.json, autonomia.json)
+├── docs/                        # Visual diagrams (arquitetura.jpg, architecture-en.jpg) & docs/guias/ARQUITETURA.md
+├── scripts/                     # iniciar-template.py, benchmark_escala.py, stress_caos_concorrencia.py
+├── src/                         # Core transactional engine (25 Python modules + emc_resources in wheel builds)
+├── tests/                       # 28 official automated test suites + 2 standalone MCP regression scripts
+├── LICENSE                      # Custom Non-Commercial Source-Available License
+├── pyproject.toml / setup.py    # v0.5.9 metadata, wheel resources & 6 CLI entrypoints (emc, emc-mcp, emc-dashboard, emc-verifier, emc-dossie, emc-gateway)
+└── requirements-execucao04.txt  # Pinned Python dependencies
+```
 
-Download the pinned `intfloat/multilingual-e5-small` ONNX files into `modelos/e5-multilingual-small/` (verified by `SHA-256` before loading; links in [`README.md`](README.md#busca-vetorial-local-onnx-e5)) to run the full cryptographic test gate and multi-process chaos harness:
+---
+
+## Local Vector Search and 28 Automated Test Suites
+
+Semantic retrieval runs `intfloat/multilingual-e5-small` locally on CPU via ONNX Runtime, verifying `SHA-256` digests before load and persisting lossless vectors in `recuperacao.sqlite3` (`packed_f64` IEEE-754 binary `BLOB` by default or `json`, rejecting lossy formats such as `packed_f32`). Place both files in `modelos/e5-multilingual-small/` (or point `EMC_EMBEDDINGS_DIR`):
+- [model.onnx](https://huggingface.co/intfloat/multilingual-e5-small/blob/614241f622f53c4eeff9890bdc4f31cfecc418b3/onnx/model.onnx) (470 MB) · [tokenizer.json](https://huggingface.co/intfloat/multilingual-e5-small/blob/614241f622f53c4eeff9890bdc4f31cfecc418b3/tokenizer.json) (17 MB)
+
+All **28 official suites** run continuously across **Ubuntu 24.04 (Python 3.11 & 3.12)**, **macOS 15**, and **Windows Server 2022**:
+- **Wheel Packaging (`1 suite`):** `testes_empacotamento_wheel.py` — clean `.whl` build bundling `emc_resources` and real execution outside the git clone.
+- **Universal Adapters (`3 suites`):** `testes_agent_sdk.py`, `testes_http_gateway.py`, and `testes_dossie_studio.py` — exact historical replay receipts across restarts, `read_only`/`read_write` scopes, pre-mkdir scope validation, and isolated `--cleanup`.
+- **Hardening, Chaos & Scale (`3 suites`):** `testes_hardening_motor.py`, `testes_fuzz_caos.py`, and `testes_auditoria_escala.py` — `Knowledge.lineage`, vector blob self-healing, RFC-6901, Unicode fuzzing, and `os._exit` crash safety.
+- **Self-Evolution Laboratory (`3 suites`):** `testes_evolucao_lab.py`, `testes_melhorias_seguranca.py`, and `testes_operacao_melhorias.py` — reopened SQLite index verification, AST sandbox isolation, and iterative 1,000+ adoption chain auditing.
+- **Core ACID, Queue, Attribution & MCP (`18 suites`):** OS file locks, *stale* cascade, attribution firewall, frozen queue contracts, and MCP protocol (full matrix in [`docs/guias/ARQUITETURA.md`](docs/guias/ARQUITETURA.md#6-matriz-das-28-suítes-oficiais-de-teste-tests)).
 
 ```bash
-# Run all 27 official suites with code-hash verification
 CEREBRO_PESSOAL_ACESSO=permitido ./.venv/bin/python src/cli.py autotestes
-
-# Run the 6-process chaos, CAS contention, ONNX E5 & lease-recovery stress harness
 CEREBRO_PESSOAL_ACESSO=permitido ./.venv/bin/python scripts/stress_caos_concorrencia.py --workers 6 --ops 15
 ```
 
-### Suite Coverage Highlights:
-- **Universal Adapters (`3 suites`):** `testes_agent_sdk.py` (Python SDK & OpenAI/Gemini tool calling), `testes_http_gateway.py` (REST API v1, auth/Host/body hardening & SVG UI), and `testes_dossie_studio.py` (engineering, legal & research audit scenarios).
-- **Motor Hardening, Adversarial Fuzzing & Chaos (`3 suites`):** `testes_hardening_motor.py` (`Knowledge.lineage`, CLI `linhagem`, ONNX E5 corrupt-blob self-healing, RFC-6901 & `bool`/`chain` guards, NFC/device-stem sanitization), `testes_fuzz_caos.py` (seeded path/Unicode fuzzing, 5-speaker attribution matrix, `os._exit` crash & anti-dirty-read blocks), and `testes_auditoria_escala.py` (hundreds-of-records scale & POSIX path parity).
-- **Self-Evolution Laboratory (`3 suites`):** `testes_evolucao_lab.py` (4-class deterministic evaluators, LIFO rollback & `audit_adoption_chain()`), `testes_melhorias_seguranca.py` (AST sandbox isolation & symlink/reparse defenses), and `testes_operacao_melhorias.py`.
-- **Core ACID Engine, Attribution, Queue & MCP (`18 suites`):** `testes.py`, `testes_conhecimento.py`, `testes_autonomia.py`, `testes_decisao.py`, `testes_esquemas.py`, `testes_recuperacao.py`, `testes_coordenador.py`, `testes_execucao.py`, `testes_runtime.py`, `testes_provedores.py`, `testes_mcp_vetores.py`, `testes_evidencias.py`, `testes_persistencia05.py`, `testes_mcp05.py`, `testes_recuperacao_fila.py`, `testes_atribuicao.py`, `testes_continuacoes07.py`, and `testes_dashboard.py` (plus standalone MCP scripts `teste_mcp.py` and `testes_mcp04.py`).
+*(On Windows PowerShell: `$env:CEREBRO_PESSOAL_ACESSO = "permitido"; .\.venv\Scripts\python.exe src/cli.py autotestes`.)*
 
 ---
 
-## License
+## Conscious Boundaries & License
 
-Published under a custom **Non-Commercial Source-Available License** ([`LICENSE`](LICENSE)), authored by **Leonardo Guimarães (`@leoguimaraes49`)**:
-- **Permitted:** Personal non-commercial use, academic research, educational study, and technical portfolio evaluation.
-- **Reserved:** Commercial use, resale, SaaS/hosted offerings, and enterprise production deployments require prior written commercial licensing from the Author.
+- **Implemented Controls:** raw-byte `SHA-256` verification, auditable revision chains, platform-specific exclusive file locks held across SQLite `COMMIT` (`CreateFileW dwShareMode=0` on Windows; `flock` + `verify_posix_file` on Linux/macOS — see [Execution Guarantees](00_Manual/manual-cerebro-15-garantias-de-execucao.md#arquivos-controlados-por-plataforma)), pre-mkdir scope validation, and LLM-free `lab-assurance-2` receipts.
+- **Explicit Non-Goals:** the system does not fabricate diagnoses or inferred profiles, does not emit unsupported probabilities, does not transmit local notes to unauthorized external services, and never performs arbitrary code self-modification or privilege escalation.
+- **License:** published under a custom **Non-Commercial Source-Available License** ([`LICENSE`](LICENSE)), authored exclusively by **Leonardo Guimarães (`@leoguimaraes49`)** — permitted for personal non-commercial use, academic research, educational study, and technical code auditing; commercial use, resale, and hosted/SaaS deployments require prior written authorization from the Author.

@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import sys
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -13,7 +14,8 @@ from pathlib import Path
 from typing import Any
 
 APP_ROOT = Path(__file__).resolve().parents[2]
-if str(APP_ROOT) not in sys.path:
+IS_REPO_CLONE = (APP_ROOT / "src" / "nucleo.py").is_file()
+if IS_REPO_CLONE and str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 from apps.http_gateway.server import (
@@ -216,12 +218,13 @@ def _run_http_demo(runtime: EpistemicGatewayRuntime, token: str | None) -> dict[
 
 
 def main(argv: list[str] | None = None) -> int:
+    default_ws_base = APP_ROOT if IS_REPO_CLONE else Path.cwd()
     parser = argparse.ArgumentParser(
         description="Epistemic HTTP Gateway & Live Lineage Graph Explorer (REST JSON v1 + SVG UI)."
     )
     parser.add_argument(
         "--workspace",
-        default=str(APP_ROOT / "testes_temporarios" / "http-gateway-demo"),
+        default=str(default_ws_base / "testes_temporarios" / "http-gateway-demo"),
         help="Diretório isolado do workspace (padrão: testes_temporarios/http-gateway-demo)",
     )
     parser.add_argument(
@@ -231,13 +234,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--token",
+        "--api-token",
+        dest="token",
         default=None,
-        help="Token Bearer da API REST (ou variável EMC_GATEWAY_TOKEN; gerado por sessão se omitido)",
+        help="Token Bearer de operador ('read_write') da API REST (ou EMC_GATEWAY_TOKEN; gerado por sessão se omitido)",
     )
     parser.add_argument(
         "--cleanup",
         action="store_true",
-        help="Remove o workspace temporário ao finalizar comandos não interativos (ex.: demo)",
+        help="Cria um subdiretório descartável exclusivo dentro de --workspace e remove apenas ele ao finalizar",
     )
 
     sub = parser.add_subparsers(dest="cmd")
@@ -245,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     p_serve = sub.add_parser("serve", help="Inicia o servidor HTTP Gateway local (padrão 127.0.0.1:8095)")
     p_serve.add_argument("--host", default=DEFAULT_HOST)
     p_serve.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_serve.add_argument("--api-token", dest="serve_token", default=None, help="Token Bearer de operador ('read_write')")
     p_serve.add_argument("--seed-demo", action="store_true", help="Popula registros iniciais de demonstração")
 
     sub.add_parser("health", help="Exibe JSON de saúde, geração e contagens do workspace")
@@ -260,65 +266,90 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    sys_root, vault_root = bootstrap_gateway_workspace(args.workspace)
-    runtime = EpistemicGatewayRuntime(
-        sys_root,
-        vault_root,
-        enable_embeddings=not args.no_embeddings,
-    )
+    effective_token = getattr(args, "serve_token", None) or args.token
+    raw_ws = Path(args.workspace).resolve()
+    parent_existed = raw_ws.exists()
+    run_dir: Path | None = None
 
-    if args.cmd == "health":
-        print(json.dumps(runtime.health(), ensure_ascii=False, indent=2))
-        return 0
-    if args.cmd == "graph":
-        print(json.dumps(runtime.graph(include_superseded=True), ensure_ascii=False, indent=2))
-        return 0
-    if args.cmd == "lineage":
-        print(json.dumps(runtime.lineage(args.record_id), ensure_ascii=False, indent=2))
-        return 0
-    if args.cmd == "demo":
-        try:
-            report = _run_http_demo(runtime, args.token)
-        finally:
-            cleaned = False
-            if args.cleanup:
-                ws_resolved = Path(args.workspace).resolve()
-                temp_root = (APP_ROOT / "testes_temporarios").resolve()
-                if temp_root in ws_resolved.parents:
-                    shutil.rmtree(ws_resolved, ignore_errors=True)
-                    cleaned = True
-        report["workspace_cleaned_up"] = cleaned
-        print(json.dumps(report, ensure_ascii=False, indent=2))
-        return 0
-    if args.cmd == "serve":
-        if args.seed_demo:
-            seed_sample_graph(runtime)
-        max_tries = 1 if args.port == 0 else 20
-        last_err: OSError | None = None
-        for idx in range(max_tries):
-            candidate_port = 0 if args.port == 0 else args.port + idx
-            if candidate_port > 65535:
-                break
+    def _cleanup_disposable_run() -> bool:
+        nonlocal run_dir
+        if not args.cleanup or run_dir is None:
+            return False
+        target = run_dir
+        run_dir = None
+        shutil.rmtree(target, ignore_errors=True)
+        if not parent_existed:
             try:
-                srv = create_gateway_server(runtime, host=args.host, port=candidate_port, api_token=args.token)
-            except OSError as exc:
-                last_err = exc
-                continue
-            bound_port = srv.server_address[1]
-            print(f"Epistemic HTTP Gateway ativo em: http://{args.host}:{bound_port}")
-            print(f"Workspace isolado: {Path(args.workspace).resolve()}")
-            print(f"Authorization: Bearer {srv.api_token}")  # type: ignore[attr-defined]
-            try:
-                srv.serve_forever()
-            except KeyboardInterrupt:
+                raw_ws.rmdir()
+            except OSError:
                 pass
-            finally:
-                srv.server_close()
-            return 0
-        raise OSError(f"Nenhuma porta local disponível a partir de {args.port}") from last_err
+        return not target.exists()
 
-    parser.print_help()
-    return 1
+    try:
+        if args.cleanup:
+            raw_ws.mkdir(parents=True, exist_ok=True)
+            run_dir = Path(tempfile.mkdtemp(prefix="emc-gw-demo-", dir=raw_ws))
+            effective_ws = run_dir
+        else:
+            effective_ws = raw_ws
+
+        sys_root, vault_root = bootstrap_gateway_workspace(effective_ws, authorize=True)
+        runtime = EpistemicGatewayRuntime(
+            sys_root,
+            vault_root,
+            enable_embeddings=not args.no_embeddings,
+        )
+
+        if args.cmd == "health":
+            print(json.dumps(runtime.health(), ensure_ascii=False, indent=2))
+            return 0
+        if args.cmd == "graph":
+            print(json.dumps(runtime.graph(include_superseded=True), ensure_ascii=False, indent=2))
+            return 0
+        if args.cmd == "lineage":
+            print(json.dumps(runtime.lineage(args.record_id), ensure_ascii=False, indent=2))
+            return 0
+        if args.cmd == "demo":
+            report = _run_http_demo(runtime, effective_token)
+            cleaned = _cleanup_disposable_run()
+            report["workspace"] = str(effective_ws)
+            report["workspace_cleaned_up"] = cleaned
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+        if args.cmd == "serve":
+            if args.seed_demo:
+                seed_sample_graph(runtime)
+            max_tries = 1 if args.port == 0 else 20
+            last_err: OSError | None = None
+            for idx in range(max_tries):
+                candidate_port = 0 if args.port == 0 else args.port + idx
+                if candidate_port > 65535:
+                    break
+                try:
+                    srv = create_gateway_server(
+                        runtime, host=args.host, port=candidate_port, api_token=effective_token
+                    )
+                except OSError as exc:
+                    last_err = exc
+                    continue
+                bound_port = srv.server_address[1]
+                print(f"Epistemic HTTP Gateway ativo em: http://{args.host}:{bound_port}")
+                print(f"Workspace isolado: {effective_ws}")
+                print("Sessão UI (GET /): escopo 'read_only' (inspeção de grafo e linhagem)")
+                print(f"Authorization (Operador read_write): Bearer {srv.api_token}")  # type: ignore[attr-defined]
+                try:
+                    srv.serve_forever()
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    srv.server_close()
+                return 0
+            raise OSError(f"Nenhuma porta local disponível a partir de {args.port}") from last_err
+
+        parser.print_help()
+        return 1
+    finally:
+        _cleanup_disposable_run()
 
 
 if __name__ == "__main__":

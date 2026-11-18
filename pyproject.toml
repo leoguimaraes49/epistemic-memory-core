@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "epistemic-memory-core"
-version = "0.5.8"
+version = "0.5.9"
 description = "Motor determinístico de memória estruturada, auditoria de premissas e verificação de evidências para agentes de IA via MCP, SDK Python e Gateway HTTP."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,7 +36,7 @@ py-modules = [
     "cli", "conhecimento", "coordenador", "dashboard", "documentos",
     "esquemas", "evidencias", "execucao", "melhorias", "nucleo",
     "pesquisa", "ponte_pessoal", "provedores", "recuperacao",
-    "recuperacao_fila", "revalidacao", "revisoes", "supervisor",
+    "recuperacao_fila", "recursos_pacote", "revalidacao", "revisoes", "supervisor",
     "verificador_evidencias"
 ]
 

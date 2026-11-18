@@ -21,6 +21,7 @@ SUITES += ('testes_recuperacao_fila.py', 'testes_melhorias_seguranca.py', 'teste
 SUITES += ('testes_atribuicao.py', 'testes_continuacoes07.py', 'testes_dashboard.py')
 SUITES += ('testes_auditoria_escala.py', 'testes_dossie_studio.py')
 SUITES += ('testes_hardening_motor.py', 'testes_fuzz_caos.py', 'testes_evolucao_lab.py', 'testes_agent_sdk.py', 'testes_http_gateway.py')
+SUITES += ('testes_empacotamento_wheel.py',)
 SUITE_TIMEOUT_SECONDS=300
 SUITE_SKIPPED_EXIT_CODE=77
 

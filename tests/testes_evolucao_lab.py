@@ -4,7 +4,9 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / 'src') not in sys.path:
@@ -115,23 +117,31 @@ class EvolutionLabTests(unittest.TestCase):
         self.assertEqual(self.read_config(), cfg_emb)
 
     def test_vector_storage_favorable_lossy_rejection_optimal_and_rollback(self):
-        # Rejeita formato float32 com perda de precisão de 64 bits mesmo ocupando menos bytes.
+        # Rejeita formato float32 não suportado / com perda de precisão no índice real.
         ev_f32, cand_f32 = self.eval_and_record('vec-f32', {'kind': 'vector_storage', 'value': 'packed_f32'})
         self.assertEqual(ev_f32['status'], 'completed')
-        self.assertLess(ev_f32['comparison']['selected_bytes'], ev_f32['comparison']['previous_bytes'])
+        self.assertFalse(ev_f32['checks']['supported_by_index'])
         self.assertFalse(ev_f32['checks']['lossless_roundtrip'])
         self.assertFalse(ev_f32['eligible'])
+        self.assertEqual(self.k.read(cand_f32['id'])['record']['payload']['adoption_status'], 'rejected')
         with self.assertRaises(Invalid):
             melhorias.adopt(self.store, 'adopt-vec-f32', cand_f32['id'])
 
-        # Adota packed_f64 quando estado atual usa json verboso, preservando permissões e pasta do modelo.
+        # Adota packed_f64 quando estado atual usa json verboso, validando em índice SQLite reaberto.
         ev_f64, cand_f64 = self.eval_and_record(
             'vec-f64',
             {'kind': 'vector_storage', 'value': 'packed_f64', 'reason': 'Armazenamento binário IEEE-754 sem perda'},
         )
         self.assertTrue(ev_f64['eligible'])
-        self.assertEqual(ev_f64['comparison']['selected_bytes'], 384 * 8)
+        self.assertEqual(ev_f64['comparison']['records_indexed'], 4)
+        self.assertEqual(ev_f64['comparison']['dimensions'], 384)
+        self.assertEqual(ev_f64['comparison']['previous_sqlite_type'], 'text')
+        self.assertEqual(ev_f64['comparison']['selected_sqlite_type'], 'blob')
+        self.assertEqual(ev_f64['comparison']['selected_bytes_per_vector'], 384 * 8)
+        self.assertEqual(ev_f64['comparison']['selected_bytes'], 4 * 384 * 8)
         self.assertLess(ev_f64['comparison']['selected_bytes'], ev_f64['comparison']['previous_bytes'])
+        self.assertTrue(ev_f64['checks']['sqlite_reopened_verified'])
+        self.assertTrue(ev_f64['checks']['search_ranking_preserved'])
         self.assertTrue(ev_f64['checks']['lossless_roundtrip'])
         self.assertTrue(ev_f64['checks']['cosine_preserved'])
 
@@ -266,6 +276,7 @@ class EvolutionLabTests(unittest.TestCase):
         self.assertEqual(empty_audit['status'], 'healthy')
         self.assertEqual(empty_audit['journal_count'], 0)
         self.assertTrue(empty_audit['chain_valid'])
+        self.assertEqual(empty_audit['chain_status'], 'valid')
         self.assertFalse(empty_audit['external_drift'])
 
         # Cadeia multi-classe com adoções e reversões LIFO.
@@ -383,6 +394,339 @@ class EvolutionLabTests(unittest.TestCase):
                 melhorias.audit_adoption_chain(self.store)
             with self.assertRaises(Invalid):
                 melhorias.diagnostics_summary(self.store)
+
+    def test_real_retrieval_sqlite_index_json_vs_packed_f64_and_packed_f32_rejection(self):
+        import sqlite3
+        from execucao import Engine
+        from recuperacao import Retrieval, _unpack_vector
+
+        class DeterministicEmbedder3D:
+            def __init__(self):
+                self.passage_calls = 0
+
+            def chunks(self, text, kind='passage'):
+                low = text.lower()
+                if kind == 'passage':
+                    self.passage_calls += 1
+                if 'alfa' in low:
+                    return [[0.9123456789012345, 0.2123456789012345, 0.35082320772281167]]
+                if 'beta' in low:
+                    return [[0.15123456789012345, 0.9412345678901235, 0.3019930123456789]]
+                return [[0.11123456789012345, 0.19123456789012345, 0.9752345678901235]]
+
+        s1 = self.store.apply('src-vec-alfa', 'create', title='Nota Alfa', text='Experimento alfa detalhado.')
+        s2 = self.store.apply('src-vec-beta', 'create', title='Nota Beta', text='Experimento beta complementar.')
+        s3 = self.store.apply('src-vec-gama', 'create', title='Nota Gama', text='Experimento gama residual.')
+
+        # 1) Formato json persiste TEXT real no SQLite via Engine/Retrieval.
+        embedder = DeterministicEmbedder3D()
+        eng_json = Engine(self.store, embedder=embedder)
+        self.assertEqual(eng_json.retrieval.vector_storage, 'json')
+        res_json = eng_json.retrieval.search('alfa experimento', limit=5)
+        self.assertEqual(res_json['results'][0]['id'], s1['id'])
+        self.assertEqual(embedder.passage_calls, 3)
+
+        db_path = self.store.root / 'estado' / 'recuperacao.sqlite3'
+        with closing(sqlite3.connect(db_path)) as conn:
+            json_rows = conn.execute(
+                'SELECT id, typeof(value), LENGTH(CAST(value AS BLOB)), value FROM vectors ORDER BY id'
+            ).fetchall()
+        self.assertEqual(len(json_rows), 3)
+        for _, sql_type, byte_len, raw_val in json_rows:
+            self.assertEqual(sql_type, 'text')
+            self.assertIsInstance(raw_val, str)
+            self.assertGreater(byte_len, 24)
+        json_unpacked = {row[0]: list(_unpack_vector(row[3], expected_dim=3)) for row in json_rows}
+
+        # 2) Adoção de packed_f64 migra os registros existentes para BLOB exato de 24 bytes (3 * 8 B) sem perda.
+        ev_f64, cand_f64 = self.eval_and_record('real-idx-f64', {'kind': 'vector_storage', 'value': 'packed_f64'})
+        self.assertTrue(ev_f64['eligible'])
+        melhorias.adopt(self.store, 'adopt-real-idx-f64', cand_f64['id'])
+
+        # Nota adicional para evitar que a candidatos de melhoria alterem a contagem sem testar migração sem re-embed.
+        passage_before_migration = embedder.passage_calls
+        reopened_ret = Retrieval(self.store, embedder=embedder)
+        self.assertEqual(reopened_ret.vector_storage, 'packed_f64')
+        res_f64 = reopened_ret.search('alfa experimento', limit=5)
+        self.assertEqual(res_f64['results'][0]['id'], s1['id'])
+        # Os 3 registros originais inalterados foram transcodificados sem recomputar seus embeddings; só os 2 registros
+        # criados por record() (fonte + candidata) exigiram chamadas novas de passagem.
+        self.assertEqual(embedder.passage_calls - passage_before_migration, 2)
+
+        with closing(sqlite3.connect(db_path)) as conn:
+            blob_rows = conn.execute(
+                'SELECT id, typeof(value), LENGTH(CAST(value AS BLOB)), value FROM vectors ORDER BY id'
+            ).fetchall()
+            meta_fmt = conn.execute("SELECT value FROM metadata WHERE key='vector_storage'").fetchone()
+        self.assertEqual(meta_fmt, ('packed_f64',))
+        self.assertGreaterEqual(len(blob_rows), 3)
+        for row_id, sql_type, byte_len, raw_val in blob_rows:
+            self.assertEqual(sql_type, 'blob')
+            self.assertIsInstance(raw_val, bytes)
+            self.assertEqual(byte_len, 24)
+            if row_id in json_unpacked:
+                self.assertEqual(list(_unpack_vector(raw_val, expected_dim=3)), json_unpacked[row_id])
+        self.assertEqual({s1['id'], s2['id'], s3['id']} <= {r[0] for r in blob_rows}, True)
+
+        # 3) packed_f32 e formatos desconhecidos são recusados tanto no construtor quanto no execucao.json.
+        for bad_fmt in ('packed_f32', 'float16', ''):
+            with self.assertRaises(Invalid):
+                Retrieval(self.store, embedder=embedder, vector_storage=bad_fmt)
+        bad_cfg = self.read_config()
+        bad_cfg['embeddings']['vector_storage'] = 'packed_f32'
+        self.write_config(bad_cfg)
+        with self.assertRaises(Invalid):
+            load_exec_config(self.store)
+        with self.assertRaises(Invalid):
+            Retrieval(self.store, embedder=embedder)
+        with self.assertRaises(Invalid):
+            Engine(self.store, embedder=embedder)
+
+    def test_1000_sequential_adoptions_audit_without_recursion_error(self):
+        from datetime import datetime, timedelta, timezone
+
+        # Exercita a auditoria completa (audit_adoption_chain) com 1.000 journals válidos em timestamps distintos.
+        cfg_pretty = copy.deepcopy(self.initial)
+        cfg_pretty['message_codec'] = 'pretty'
+        cfg_compact = copy.deepcopy(self.initial)
+        cfg_compact['message_codec'] = 'compact'
+
+        ev_to_compact = melhorias._measure({'kind': 'message_codec', 'value': 'compact'}, cfg_pretty)
+        self.assertTrue(ev_to_compact['eligible'])
+
+        # Registra uma candidata real para usar estrutura canônica e gera 1.000 transições válidas (500 ciclos adopt+rollback = 1.000 eventos,
+        # além de testar 1.000 journals distintos em _solve_transition_chain e audit_adoption_chain).
+        _, proto_cand = self.eval_and_record('scale-proto', {'kind': 'message_codec', 'value': 'compact'})
+        proto_record = self.k.read(proto_cand['id'])['record']
+        adocoes_dir = self.store.root / 'estado' / 'adocoes'
+        adocoes_dir.mkdir(parents=True, exist_ok=True)
+
+        base_dt = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        synthetic_entries = []
+        # 1.020 eventos sequenciais alternados em timestamps distintos (510 ciclos de adopt + rollback).
+        for idx in range(510):
+            t_adopt = (base_dt + timedelta(seconds=idx * 2)).isoformat(timespec='seconds')
+            t_rb = (base_dt + timedelta(seconds=idx * 2 + 1)).isoformat(timespec='seconds')
+            cand_snap = {
+                'id': f'cand-scale-{idx:04d}',
+                'revision': 1,
+                'record_type': 'improvement_candidate',
+                'title': proto_record['title'],
+                'payload': copy.deepcopy(proto_record['payload']),
+            }
+            state = {
+                'version': 2,
+                'status': 'rolled_back',
+                'phase': 'rolled_back',
+                'candidate_id': cand_snap['id'],
+                'before': copy.deepcopy(cfg_pretty),
+                'after': copy.deepcopy(cfg_compact),
+                'previous_revision': 1,
+                'candidate_before': cand_snap,
+                'created_at': t_adopt,
+                'adopted_at': t_adopt,
+                'rolled_back_at': t_rb,
+                'rollback_intent': {
+                    'candidate_before': melhorias._next_candidate(cand_snap, 'adopted'),
+                    'config_from': copy.deepcopy(cfg_compact),
+                },
+            }
+            state['rollback_hash'] = sha(canon(state['rollback_intent']).encode())
+            state['intent_hash'] = sha(canon(melhorias._intent(state)).encode())
+            melhorias._check_journal(state)
+            synthetic_entries.append({
+                'key': f'scale-{idx:04d}',
+                'valid': True,
+                'status': 'rolled_back',
+                'state': state,
+                'mtime_ns': idx + 1,
+            })
+
+        # Também testa 1.000 journals distintos 'adopted' em dias distintos diretamente em _solve_transition_chain.
+        thousand_adopted = []
+        cur_cfg = copy.deepcopy(cfg_pretty)
+        for idx in range(1000):
+            nxt_cfg = copy.deepcopy(cur_cfg)
+            nxt_cfg['max_seconds'] = 1800 - (idx + 1)  # 1799 -> 800 (todos viáveis e estritamente decrescentes)
+            ev_step = melhorias._measure({'kind': 'batch_limits', 'value': {'max_seconds': nxt_cfg['max_seconds']}}, cur_cfg)
+            self.assertTrue(ev_step['eligible'])
+            ts = (base_dt + timedelta(days=idx)).isoformat(timespec='seconds')
+            cand_snap = {
+                'id': f'cand-day-{idx:04d}',
+                'revision': 1,
+                'record_type': 'improvement_candidate',
+                'title': 'Candidata diária',
+                'payload': {
+                    'purpose': 'Reduzir janela máxima',
+                    'problem': 'Escala histórica',
+                    'basis_refs': proto_record['payload']['basis_refs'],
+                    'acceptance_criteria': ['manter viabilidade'],
+                    'comparison': ev_step,
+                    'comparison_refs': proto_record['payload']['comparison_refs'],
+                    'adoption_status': 'tested',
+                    'rollback_plan': 'Reverter max_seconds.',
+                },
+            }
+            st = {
+                'version': 2,
+                'status': 'adopted',
+                'phase': 'adopted',
+                'candidate_id': cand_snap['id'],
+                'before': cur_cfg,
+                'after': nxt_cfg,
+                'previous_revision': 1,
+                'candidate_before': cand_snap,
+                'created_at': ts,
+                'adopted_at': ts,
+            }
+            st['intent_hash'] = sha(canon(melhorias._intent(st)).encode())
+            thousand_adopted.append({
+                'key': f'day-{idx:04d}',
+                'valid': True,
+                'status': 'adopted',
+                'state': st,
+                'mtime_ns': idx + 1,
+            })
+            cur_cfg = nxt_cfg
+
+        walk_days, gap_days = melhorias._solve_transition_chain(thousand_adopted)
+        self.assertIsNone(gap_days)
+        self.assertEqual(len(walk_days), 1000)
+        self.assertEqual(walk_days[-1]['after_config']['max_seconds'], 800)
+
+        walk_rb, gap_rb = melhorias._solve_transition_chain(synthetic_entries)
+        self.assertIsNone(gap_rb)
+        self.assertEqual(len(walk_rb), 1020)
+
+        # Exercita audit_adoption_chain ponta a ponta lendo journals do disco sem RecursionError (510 ciclos = 1.020 eventos).
+        with patch.object(
+            melhorias,
+            '_candidate',
+            side_effect=lambda _k, cid: melhorias._next_candidate(
+                melhorias._next_candidate(synthetic_entries[int(cid.split('-')[-1])]['state']['candidate_before'], 'adopted'),
+                'rolled_back',
+            ),
+        ):
+            for entry in synthetic_entries:
+                (adocoes_dir / (entry['key'] + '.json')).write_text(canon(entry['state']), encoding='utf-8')
+            self.write_config(cfg_pretty)
+            audit_1000 = melhorias.audit_adoption_chain(self.store)
+
+        self.assertTrue(audit_1000['healthy'])
+        self.assertTrue(audit_1000['chain_valid'])
+        self.assertEqual(audit_1000['chain_status'], 'valid')
+        self.assertEqual(audit_1000['journal_count'], 510)
+        self.assertEqual(len(audit_1000['chain']), 1020)
+        self.assertEqual(audit_1000['issues'], [])
+
+    def test_inconclusive_chain_vs_broken_chain_and_authorized_scope_helper(self):
+        import os
+        from nucleo import is_authorized_scope
+
+        # 1) Empate massivo no mesmo segundo (> MAX_TIE_GROUP_SIZE) estruturalmente equilibrado => inconclusive_chain.
+        cfg_a = copy.deepcopy(self.initial)
+        cfg_a['message_codec'] = 'pretty'
+        cfg_b = copy.deepcopy(self.initial)
+        cfg_b['message_codec'] = 'compact'
+        ev_ab = melhorias._measure({'kind': 'message_codec', 'value': 'compact'}, cfg_a)
+        same_ts = '2026-11-18T12:00:00+00:00'
+
+        tie_entries = []
+        cycles = (melhorias.MAX_TIE_GROUP_SIZE // 2) + 4  # > MAX_TIE_GROUP_SIZE eventos no mesmo timestamp
+        for idx in range(cycles):
+            cand_snap = {
+                'id': f'tie-cand-{idx:03d}',
+                'revision': 1,
+                'record_type': 'improvement_candidate',
+                'title': 'Empate temporal',
+                'payload': {'adoption_status': 'tested', 'comparison': ev_ab},
+            }
+            st = {
+                'version': 2,
+                'status': 'rolled_back',
+                'phase': 'rolled_back',
+                'candidate_id': cand_snap['id'],
+                'before': copy.deepcopy(cfg_a),
+                'after': copy.deepcopy(cfg_b),
+                'previous_revision': 1,
+                'candidate_before': cand_snap,
+                'created_at': same_ts,
+                'adopted_at': same_ts,
+                'rolled_back_at': same_ts,
+                'rollback_intent': {
+                    'candidate_before': melhorias._next_candidate(cand_snap, 'adopted'),
+                    'config_from': copy.deepcopy(cfg_b),
+                },
+            }
+            tie_entries.append({'key': f'tie-{idx:03d}', 'valid': True, 'status': 'rolled_back', 'state': st, 'mtime_ns': idx})
+
+        walk_inc, gap_inc = melhorias._solve_transition_chain(tie_entries)
+        self.assertIsNone(walk_inc)
+        self.assertEqual(gap_inc['code'], 'inconclusive_chain')
+
+        adocoes_dir = self.store.root / 'estado' / 'adocoes'
+        adocoes_dir.mkdir(parents=True, exist_ok=True)
+        with patch.object(melhorias, '_check_journal', return_value=None), \
+             patch.object(
+                 melhorias,
+                 '_candidate',
+                 side_effect=lambda _k, cid: melhorias._next_candidate(
+                     melhorias._next_candidate(tie_entries[int(cid.split('-')[-1])]['state']['candidate_before'], 'adopted'),
+                     'rolled_back',
+                 ),
+             ):
+            for entry in tie_entries:
+                (adocoes_dir / (entry['key'] + '.json')).write_text(canon(entry['state']), encoding='utf-8')
+            audit_inc = melhorias.audit_adoption_chain(self.store)
+
+        self.assertFalse(audit_inc['healthy'])
+        self.assertFalse(audit_inc['chain_valid'])
+        self.assertEqual(audit_inc['chain_status'], 'inconclusive')
+        self.assertTrue(any(i['code'] == 'inconclusive_chain' for i in audit_inc['issues']))
+        self.assertFalse(any(i['code'] == 'broken_chain' for i in audit_inc['issues']))
+
+        # 2) Se houver ruptura estrutural real (mesmo após o grupo inconclusivo), classifica como broken_chain.
+        cfg_orphan = copy.deepcopy(cfg_a)
+        cfg_orphan['owner_person_id'] = 'edicao-externa-nao-rastreada'
+        cfg_orphan_after = copy.deepcopy(cfg_orphan)
+        cfg_orphan_after['message_codec'] = 'compact'
+        broken_entry = {
+            'key': 'z-broken-tail',
+            'valid': True,
+            'status': 'adopted',
+            'state': {
+                'version': 2,
+                'status': 'adopted',
+                'phase': 'adopted',
+                'candidate_id': 'broken-cand',
+                'before': cfg_orphan,
+                'after': cfg_orphan_after,
+                'previous_revision': 1,
+                'candidate_before': {'id': 'broken-cand', 'revision': 1, 'record_type': 'improvement_candidate',
+                                     'title': 'Ruptura', 'payload': {'adoption_status': 'tested', 'comparison': ev_ab}},
+                'created_at': '2026-11-18T12:00:05+00:00',
+                'adopted_at': '2026-11-18T12:00:05+00:00',
+            },
+            'mtime_ns': 9999,
+        }
+        walk_brk, gap_brk = melhorias._solve_transition_chain(tie_entries + [broken_entry])
+        self.assertIsNone(walk_brk)
+        self.assertEqual(gap_brk['code'], 'broken_chain')
+
+        # 3) Validação de is_authorized_scope e Store recusando pasta externa antes de criar diretórios.
+        with tempfile.TemporaryDirectory(prefix='emc-unauth-scope-') as ext_tmp:
+            ext_path = Path(ext_tmp)
+            with patch.dict(os.environ, {'EMC_AUTHORIZED_ROOTS': ''}, clear=False):
+                self.assertFalse(is_authorized_scope(ext_path / 'sistema', ext_path / 'cofre'))
+                with self.assertRaises(Invalid):
+                    Store(ext_path / 'sistema', ext_path / 'cofre')
+                self.assertEqual(list(ext_path.iterdir()), [])
+
+            with patch.dict(os.environ, {'EMC_AUTHORIZED_ROOTS': str(ext_path)}, clear=False):
+                self.assertTrue(is_authorized_scope(ext_path / 'sistema', ext_path / 'cofre'))
+                ext_store = Store(ext_path / 'sistema', ext_path / 'cofre')
+                created = ext_store.apply('ext-src-1', 'create', title='Fonte Autorizada', text='Conteúdo isolado.')
+                self.assertEqual(ext_store.read(created['id'])['revision'], 1)
 
 
 class IsolatedSandboxEvolutionTests(unittest.TestCase):
