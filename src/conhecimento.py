@@ -4,14 +4,17 @@ A IA fornece extrações explícitas. O serviço valida estrutura e proveniênci
 não extrai significado com regras lexicais nem inventa biografia.
 """
 import json
+import os
 import re
 import sqlite3
+import time
 import unicodedata
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 # Este alias adquire conteúdo; mutexes continuam usando nucleo.exclusive, imediato.
-from nucleo import Store, Invalid, Conflict, Uncertain, NOW, sha, canon, render, acquire_content as exclusive, verify_posix_file
+from nucleo import Store, Invalid, Conflict, Uncertain, NOW, sha, canon, render, acquire_content as exclusive, read_exclusive, verify_posix_file, _has_visible_text
 import esquemas
 
 FOLDERS = {'entity': '10_Entidades', 'assertion': '20_Afirmacoes',
@@ -31,7 +34,8 @@ def decode(data):
     if not match:
         raise Invalid('nota sem envelope canônico')
     header = {}
-    for line in match[1].splitlines():
+    for raw_line in match[1].split('\n'):
+        line = raw_line[:-1] if raw_line.endswith('\r') else raw_line
         key, sep, value = line.partition(': ')
         if not sep or key in header:
             raise Invalid('cabeçalho inválido')
@@ -41,6 +45,33 @@ def decode(data):
 
 def refs(payload):
     return esquemas.references(payload)
+
+
+def _named_refs(payload):
+    items = []
+    if not isinstance(payload, dict):
+        return items
+    for name in esquemas.LIST_REFS:
+        if name in payload and isinstance(payload[name], list):
+            for ref in payload[name]:
+                if isinstance(ref, dict) and isinstance(ref.get('record_id'), str) and ref['record_id']:
+                    items.append((name, ref))
+    for name in esquemas.SINGLE_REFS:
+        if name in payload and isinstance(payload[name], dict):
+            ref = payload[name]
+            if isinstance(ref.get('record_id'), str) and ref['record_id']:
+                items.append((name, ref))
+    if payload.get('review_status') in ('confirmed_by_user', 'disputed_by_user'):
+        events = payload.get('review_events', [])
+        if isinstance(events, list) and events and isinstance(events[-1], dict):
+            ref = events[-1].get('source_ref')
+            if isinstance(ref, dict) and isinstance(ref.get('record_id'), str) and ref['record_id']:
+                items.append(('review_events[-1].source_ref', ref))
+    return items
+
+
+def _is_orphan_tmp(name):
+    return bool(re.search(r'\.tmp(?:-[A-Za-z0-9_-]+)?\Z', name))
 
 
 def norm(text):
@@ -92,6 +123,28 @@ class Knowledge:
             with c: yield c
         finally: c.close()
 
+    def _load_db_state(self):
+        with self.connect() as c:
+            managed_rows = c.execute('SELECT id, path, digest, revision FROM managed').fetchall()
+            proposed_rows = c.execute("SELECT path, data, result FROM operations WHERE status='proposed'").fetchall()
+        managed_map = {row[0]: row[2] for row in managed_rows}
+        managed_by_path = {
+            unicodedata.normalize('NFC', row[1].replace('\\', '/')): (row[0], row[2], row[3])
+            for row in managed_rows if isinstance(row[1], str)
+        }
+        proposed_by_path = {}
+        proposed_meta_by_path = {}
+        for op_path, op_data, op_result in proposed_rows:
+            if isinstance(op_path, str):
+                norm_op_path = unicodedata.normalize('NFC', op_path.replace('\\', '/'))
+                proposed_by_path.setdefault(norm_op_path, []).append(op_data)
+                try:
+                    parsed_res = json.loads(op_result) if op_result else {}
+                except (ValueError, TypeError):
+                    parsed_res = {}
+                proposed_meta_by_path.setdefault(norm_op_path, []).append(parsed_res)
+        return managed_rows, managed_map, managed_by_path, proposed_by_path, proposed_meta_by_path
+
     def catalog(self, recovering=None):
         records, paths, issues = {}, {}, []
         # Fontes são lidas pela autoridade já existente: hash, revisão e tombstone.
@@ -103,13 +156,7 @@ class Knowledge:
             for item in self.sources.list():
                 record = self.sources.read(item['id'])
                 records[record['id']] = record
-        with self.connect() as c:
-            managed_map = dict(c.execute('SELECT id, digest FROM managed').fetchall())
-            proposed_rows = c.execute("SELECT path, data FROM operations WHERE status='proposed'").fetchall()
-        proposed_by_path = {}
-        for op_path, op_data in proposed_rows:
-            if isinstance(op_path, str):
-                proposed_by_path.setdefault(op_path.replace('\\', '/'), []).append(op_data)
+        managed_rows, managed_map, managed_by_path, proposed_by_path, proposed_meta_by_path = self._load_db_state()
         for kind, folder in FOLDERS.items():
             directory = self.vault / folder
             if directory.is_symlink() or not directory.resolve().is_relative_to(self.vault):
@@ -117,25 +164,60 @@ class Knowledge:
             for path in directory.glob('*.md'):
                 if path.is_symlink():
                     raise Invalid('nota redirecionada')
+                rel_path = unicodedata.normalize('NFC', path.relative_to(self.vault).as_posix())
+                path_owner = managed_by_path.get(rel_path)
+                pending_list = proposed_by_path.get(rel_path)
                 try:
-                    data = path.read_bytes(); record = decode(data)
-                except (Invalid, ValueError, KeyError):
+                    data = read_exclusive(path); record = decode(data)
+                except FileNotFoundError:
+                    continue
+                except (Invalid, ValueError, KeyError, TypeError):
+                    if path_owner is not None:
+                        raise Conflict('edição externa de conhecimento')
+                    if pending_list:
+                        metas = proposed_meta_by_path.get(rel_path, [])
+                        if (recovering is not None and len(metas) == 1
+                                and isinstance(metas[0], dict)
+                                and metas[0].get('id') == recovering
+                                and metas[0].get('revision') == 1):
+                            continue
+                        raise Conflict('criação de conhecimento ainda não confirmada; reconciliar antes de usar')
                     issues.append({'file': path.name, 'reason': 'formato não reconhecido'})
                     continue
                 ident = record.get('id')
+                if not isinstance(ident, str) or not ident:
+                    if path_owner is not None:
+                        raise Conflict('edição externa de conhecimento')
+                    if pending_list:
+                        raise Conflict('criação de conhecimento ainda não confirmada; reconciliar antes de usar')
+                    issues.append({'file': path.name, 'reason': 'formato não reconhecido'})
+                    continue
+                actual_sha = sha(data)
+                known_digest = managed_map.get(ident)
+                # Evita falso Conflict por leitura entre o fechamento do arquivo e o commit no SQLite em outro processo.
+                if recovering is None and ((known_digest is None and pending_list) or (known_digest is not None and known_digest != actual_sha)):
+                    time.sleep(0.025)
+                    managed_rows, managed_map, managed_by_path, proposed_by_path, proposed_meta_by_path = self._load_db_state()
+                    path_owner = managed_by_path.get(rel_path)
+                    pending_list = proposed_by_path.get(rel_path)
+                    known_digest = managed_map.get(ident)
+                if path_owner is not None and path_owner[0] != ident:
+                    raise Conflict('identidade divergente no caminho controlado')
                 if ident in records:
                     raise Conflict('identidade duplicada no cofre')
-                rel_path = path.relative_to(self.vault).as_posix()
-                known_digest = managed_map.get(ident)
-                pending_list = proposed_by_path.get(rel_path)
                 if known_digest is None and pending_list and recovering != ident:
                     raise Conflict('criação de conhecimento ainda não confirmada; reconciliar antes de usar')
-                if known_digest is not None and known_digest != sha(data):
+                if known_digest is not None and known_digest != actual_sha:
                     if recovering != ident:
                         raise Conflict('edição externa ou efeito pendente; reconciliar antes de usar')
                     if not pending_list or not any(op_data == data for op_data in pending_list):
                         raise Conflict('edição externa de conhecimento')
                 records[ident] = record; paths[ident] = path
+        for m_id, m_path, _, _ in managed_rows:
+            norm_m_path = unicodedata.normalize('NFC', m_path.replace('\\', '/'))
+            found_path = paths.get(m_id)
+            if found_path is None or unicodedata.normalize('NFC', found_path.relative_to(self.vault).as_posix()) != norm_m_path:
+                raise Conflict('arquivo de conhecimento ausente ou movido externamente; reconciliar antes de usar')
         return records, paths, issues
 
     def _validate(self, kind, payload, records, current_id=None, *, review_authorized=False):
@@ -326,7 +408,8 @@ class Knowledge:
 
     def apply(self, key, kind, title, payload, ident=None, expected=None, *, review_authorized=False):
         """review_authorized é capacidade interna da revisão humana, nunca um campo vindo do modelo."""
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', key) or not title.strip() or len(title) > 120 or any(x in title for x in '[]|#'):
+        if (not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', key)
+                or not _has_visible_text(title) or len(title) > 120 or any(x in title for x in '[]|#')):
             raise Invalid('chave ou título inválido')
         if type(review_authorized) is not bool or review_authorized and kind!='assertion':
             raise Invalid('autorização de revisão interna inválida')
@@ -376,7 +459,8 @@ class Knowledge:
                     directory = self.vault / FOLDERS[kind]; directory.mkdir(parents=True,exist_ok=True)
                     reserved=[PurePosixPath(row[0].replace('\\', '/')).name for row in c.execute("SELECT path FROM operations WHERE status!='confirmed'").fetchall()
                               if row[0] and PurePosixPath(row[0].replace('\\', '/')).parent.as_posix()==FOLDERS[kind]]
-                    path = directory / filename(title, ident, [f.name for f in directory.iterdir()]+reserved)
+                    existing_names = [f.name for f in directory.iterdir() if not _is_orphan_tmp(f.name)] + reserved
+                    path = directory / filename(title, ident, existing_names)
                     record = {'id':ident,'record_type':kind,'schema_version':'0.1','revision':1,'title':title,'created_at':now,'updated_at':now,'created_by':'extensao_conhecimento','access_policy_ref':'proprietario_local','lifecycle_status':'active','payload_format':'brain_json_v1'}
                 self._reserve_business(c,kind,payload,ident)
                 record['title'] = title; record['payload'] = payload
@@ -392,7 +476,6 @@ class Knowledge:
             if op[0] == 'confirmed': return result
             known = c.execute('SELECT digest,revision FROM managed WHERE id=?',(result['id'],)).fetchone()
             with exclusive(path, create=not path.exists()) as stream:
-                import os
                 fd = stream.fileno()
                 old = stream.read()
                 if old != data:
@@ -402,7 +485,16 @@ class Knowledge:
                         hist = self.root / 'estado' / 'conhecimento_revisoes' / result['id']; hist.mkdir(parents=True,exist_ok=True)
                         archive = hist / (str(expected)+'.md')
                         if archive.exists() and archive.read_bytes() != old: raise Conflict('histórico divergente')
-                        if not archive.exists(): archive.write_bytes(old)
+                        if not archive.exists():
+                            tmp_arc = hist / f'{expected}.md.tmp-{uuid.uuid4().hex}'
+                            try:
+                                tmp_arc.write_bytes(old)
+                                os.replace(tmp_arc, archive)
+                            except BaseException:
+                                if tmp_arc.exists():
+                                    try: tmp_arc.unlink()
+                                    except OSError: pass
+                                raise
                     if os.name != 'nt':
                         verify_posix_file(path, fd, old)
                     stream.seek(0); stream.write(data); stream.truncate(); stream.flush(); os.fsync(fd)
@@ -452,8 +544,287 @@ class Knowledge:
             return {'record':None,'validity':'needs_revalidation','reason':'Conteúdo derivado suspenso até revalidar bases corrigidas ou indisponíveis.'}
         return {'record':records[ident],'validity':'current_within_scope'}
 
+    def lineage(self, record_id: str) -> dict:
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise Invalid('registro inexistente')
+        records, paths, issues = self.catalog()
+        if record_id not in records:
+            raise Invalid('registro inexistente')
+        stale_ids = self.stale(records)
+        source_digests = {}
+        tombstoned_ids = set()
+        sources_connect = getattr(self.sources, 'connect', None)
+        if sources_connect is not None:
+            with sources_connect() as sc:
+                source_digests = {r[0]: r[1] for r in sc.execute('SELECT id, digest FROM records').fetchall()}
+                tombstoned_ids = {r[0] for r in sc.execute('SELECT record_id FROM tombstones').fetchall()}
+        with self.connect() as kc:
+            managed_digests = {r[0]: r[1] for r in kc.execute('SELECT id, digest FROM managed').fetchall()}
+
+        integrity_cache = {}
+        def _integrity(ident):
+            if ident in integrity_cache:
+                return integrity_cache[ident]
+            rec = records.get(ident)
+            if rec is None:
+                res = (None, None, False)
+            else:
+                rec_sha = sha(_request_json(rec).encode('utf-8'))
+                if rec['record_type'] == 'source':
+                    if ident in source_digests:
+                        res = (source_digests[ident], rec_sha, True)
+                    else:
+                        res = (rec_sha, rec_sha, True)
+                elif ident in paths:
+                    raw = read_exclusive(paths[ident])
+                    file_sha = sha(raw)
+                    expected_sha = managed_digests.get(ident)
+                    res = (file_sha, rec_sha, (file_sha == expected_sha) if expected_sha is not None else True)
+                else:
+                    res = (rec_sha, rec_sha, True)
+            integrity_cache[ident] = res
+            return res
+
+        outgoing = {}
+        incoming = {}
+        for ident, rec in sorted(records.items()):
+            edges_out = []
+            for field, ref in _named_refs(rec.get('payload', {})):
+                target_id = ref['record_id']
+                pinned_rev = ref.get('revision') if type(ref.get('revision')) is int else None
+                edges_out.append((target_id, field, pinned_rev))
+                if target_id in records:
+                    incoming.setdefault(target_id, []).append((ident, field, pinned_rev))
+            outgoing[ident] = edges_out
+
+        # Upstream BFS (record -> bases)
+        up_hop = {}
+        up_pins = {}
+        up_edges = []
+        seen_up_edges = set()
+        q = deque([(record_id, 0)])
+        while q:
+            cur, dist = q.popleft()
+            for tgt_id, field, pinned_rev in outgoing.get(cur, ()):
+                tgt_rec = records.get(tgt_id)
+                cur_rev = tgt_rec['revision'] if tgt_rec is not None else None
+                rev_ok = cur_rev is not None and pinned_rev == cur_rev
+                edge_key = (cur, tgt_id, field, pinned_rev)
+                if edge_key not in seen_up_edges:
+                    seen_up_edges.add(edge_key)
+                    up_edges.append({
+                        'from': cur,
+                        'to': tgt_id,
+                        'field': field,
+                        'pinned_revision': pinned_rev,
+                        'current_revision': cur_rev,
+                        'revision_valid': rev_ok,
+                        'outdated': not rev_ok,
+                    })
+                if tgt_id != record_id:
+                    if pinned_rev is not None:
+                        up_pins.setdefault(tgt_id, []).append(pinned_rev)
+                    else:
+                        up_pins.setdefault(tgt_id, [])
+                    if tgt_id not in up_hop:
+                        up_hop[tgt_id] = dist + 1
+                        if tgt_rec is not None:
+                            q.append((tgt_id, dist + 1))
+
+        # Downstream BFS (dependents -> record)
+        down_hop = {}
+        down_edges = []
+        seen_down_edges = set()
+        q = deque([(record_id, 0)])
+        while q:
+            cur, dist = q.popleft()
+            for dep_id, field, pinned_rev in incoming.get(cur, ()):
+                cur_rec = records.get(cur)
+                cur_rev = cur_rec['revision'] if cur_rec is not None else None
+                rev_ok = cur_rev is not None and pinned_rev == cur_rev
+                edge_key = (dep_id, cur, field, pinned_rev)
+                if edge_key not in seen_down_edges:
+                    seen_down_edges.add(edge_key)
+                    down_edges.append({
+                        'from': dep_id,
+                        'to': cur,
+                        'field': field,
+                        'pinned_revision': pinned_rev,
+                        'current_revision': cur_rev,
+                        'revision_valid': rev_ok,
+                        'outdated': not rev_ok,
+                    })
+                if dep_id != record_id and dep_id not in down_hop:
+                    down_hop[dep_id] = dist + 1
+                    q.append((dep_id, dist + 1))
+
+        # 3-color iterative DFS cycle detection (distinguishes genuine directed cycles from diamond DAGs)
+        cycle_edges = []
+        seen_cycles = set()
+        def _detect_cycles(adj_fn, direction):
+            color = {}
+            stack = [(record_id, 0)]
+            color[record_id] = 1
+            while stack:
+                node, idx = stack[-1]
+                neighbors = adj_fn(node)
+                if idx < len(neighbors):
+                    stack[-1] = (node, idx + 1)
+                    nxt = neighbors[idx]
+                    st = color.get(nxt, 0)
+                    if st == 1:
+                        ck = (node, nxt, direction)
+                        if ck not in seen_cycles:
+                            seen_cycles.add(ck)
+                            cycle_edges.append({'from': node, 'to': nxt, 'direction': direction})
+                    elif st == 0 and nxt in records:
+                        color[nxt] = 1
+                        stack.append((nxt, 0))
+                else:
+                    color[node] = 2
+                    stack.pop()
+
+        _detect_cycles(lambda n: [t for t, _, _ in outgoing.get(n, ())], 'upstream')
+        _detect_cycles(lambda n: [d for d, _, _ in incoming.get(n, ())], 'downstream')
+
+        upstream_all = []
+        for uid, hop in sorted(up_hop.items(), key=lambda kv: (kv[1], kv[0])):
+            urec = records.get(uid)
+            u_sha, u_rec_sha, u_sha_valid = _integrity(uid)
+            cur_rev = urec['revision'] if urec is not None else None
+            pins_raw = up_pins.get(uid, [])
+            pinned_revs = sorted(set(pins_raw))
+            mismatches = [r for r in pins_raw if cur_rev is None or r != cur_rev]
+            chosen_pin = mismatches[0] if mismatches else (pins_raw[0] if pins_raw else None)
+            rev_valid = (urec is not None and bool(pinned_revs) and all(r == cur_rev for r in pinned_revs))
+            is_src = (urec is not None and urec['record_type'] == 'source') or (urec is None and uid in tombstoned_ids)
+            upstream_all.append({
+                'id': uid,
+                'title': urec['title'] if urec is not None else None,
+                'record_type': urec['record_type'] if urec is not None else ('source' if uid in tombstoned_ids else 'unknown'),
+                'folder': '30_Fontes' if is_src else (FOLDERS.get(urec['record_type']) if urec is not None else None),
+                'hop': hop,
+                'direct': hop == 1,
+                'pinned_revision': chosen_pin,
+                'pinned_revisions': pinned_revs,
+                'current_revision': cur_rev,
+                'revision_valid': rev_valid,
+                'outdated': not rev_valid,
+                'sha256': u_sha,
+                'record_sha256': u_rec_sha,
+                'sha256_valid': u_sha_valid,
+                'status': ('excluded' if uid in tombstoned_ids else 'missing' if urec is None
+                           else 'suspended' if uid in stale_ids else 'active'),
+                'validity': ('unavailable' if urec is None
+                             else 'needs_revalidation' if uid in stale_ids else 'current_within_scope'),
+            })
+
+        upstream_direct = [item for item in upstream_all if item['hop'] == 1]
+        upstream_transitive = [item for item in upstream_all if item['hop'] >= 2]
+        upstream_sources = [item for item in upstream_all if item['record_type'] == 'source']
+        upstream_intermediate = [item for item in upstream_all if item['record_type'] != 'source']
+
+        downstream_all = []
+        for did, hop in sorted(down_hop.items(), key=lambda kv: (kv[1], kv[0])):
+            drec = records[did]
+            d_sha, d_rec_sha, d_sha_valid = _integrity(did)
+            is_stale = did in stale_ids
+            downstream_all.append({
+                'id': did,
+                'title': drec['title'],
+                'record_type': drec['record_type'],
+                'folder': '30_Fontes' if drec['record_type'] == 'source' else FOLDERS.get(drec['record_type']),
+                'revision': drec['revision'],
+                'hop': hop,
+                'direct': hop == 1,
+                'status': 'suspended' if is_stale else 'active',
+                'validity': 'needs_revalidation' if is_stale else 'current_within_scope',
+                'sha256': d_sha,
+                'record_sha256': d_rec_sha,
+                'sha256_valid': d_sha_valid,
+            })
+
+        downstream_active = [item for item in downstream_all if item['status'] == 'active']
+        downstream_suspended = [item for item in downstream_all if item['status'] == 'suspended']
+        downstream_direct = [item for item in downstream_all if item['hop'] == 1]
+        downstream_transitive = [item for item in downstream_all if item['hop'] >= 2]
+
+        target_rec = records[record_id]
+        t_sha, t_rec_sha, t_sha_valid = _integrity(record_id)
+        t_stale = record_id in stale_ids
+        return {
+            'status': 'ok',
+            'record_id': record_id,
+            'target': {
+                'id': record_id,
+                'title': target_rec['title'],
+                'record_type': target_rec['record_type'],
+                'folder': '30_Fontes' if target_rec['record_type'] == 'source' else FOLDERS.get(target_rec['record_type']),
+                'revision': target_rec['revision'],
+                'status': 'suspended' if t_stale else 'active',
+                'validity': 'needs_revalidation' if t_stale else 'current_within_scope',
+                'lifecycle_status': target_rec.get('lifecycle_status', 'active'),
+                'sha256': t_sha,
+                'record_sha256': t_rec_sha,
+                'sha256_valid': t_sha_valid,
+                'created_at': target_rec.get('created_at'),
+                'updated_at': target_rec.get('updated_at'),
+            },
+            'upstream': {
+                'direct': upstream_direct,
+                'transitive': upstream_transitive,
+                'all': upstream_all,
+                'sources': upstream_sources,
+                'intermediate': upstream_intermediate,
+                'edges': up_edges,
+                'counts': {
+                    'total': len(upstream_all),
+                    'direct': len(upstream_direct),
+                    'transitive': len(upstream_transitive),
+                    'sources': len(upstream_sources),
+                    'intermediate': len(upstream_intermediate),
+                    'outdated': sum(1 for item in upstream_all if item['outdated']),
+                },
+            },
+            'downstream': {
+                'active': downstream_active,
+                'suspended': downstream_suspended,
+                'direct': downstream_direct,
+                'transitive': downstream_transitive,
+                'all': downstream_all,
+                'edges': down_edges,
+                'counts': {
+                    'total': len(downstream_all),
+                    'direct': len(downstream_direct),
+                    'transitive': len(downstream_transitive),
+                    'active': len(downstream_active),
+                    'suspended': len(downstream_suspended),
+                },
+            },
+            'blast_radius': {
+                'total_dependents': len(downstream_all),
+                'direct_count': len(downstream_direct),
+                'transitive_count': len(downstream_transitive),
+                'active_count': len(downstream_active),
+                'suspended_count': len(downstream_suspended),
+                'active_ids': [item['id'] for item in downstream_active],
+                'suspended_ids': [item['id'] for item in downstream_suspended],
+                'active': downstream_active,
+                'suspended': downstream_suspended,
+            },
+            'cycles_detected': bool(cycle_edges),
+            'cycle_edges': cycle_edges,
+            'issues': issues,
+            'limits': [
+                'Linhagem determinística baseada nas revisões e hashes registrados; não certifica veracidade factual nem diagnóstico.'
+            ],
+        }
+
     def search(self, query, limit=12, depth=1):
-        if not query.strip() or len(query)>500 or not 1<=limit<=50 or not 0<=depth<=2: raise Invalid('busca fora dos limites')
+        if (not isinstance(query, str) or not query.strip() or len(query)>500
+                or type(limit) is not int or not 1<=limit<=50
+                or type(depth) is not int or not 0<=depth<=2):
+            raise Invalid('busca fora dos limites')
         records, _, issues = self.catalog(); tokens=set(re.findall(r'\w+',norm(query)))
         stale=self.stale(records)
         ranked=[]
@@ -481,7 +852,7 @@ class Knowledge:
 
     def contribution(self, key, title, original, extractions):
         """Entrega parcial explícita; repetir o mesmo pedido retoma sem duplicar."""
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,60}',key) or not isinstance(extractions,list) or len(extractions)>20:
+        if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,60}',key) or not isinstance(extractions,list) or len(extractions)>20:
             raise Invalid('pedido de contribuição fora dos limites')
         for item in extractions:
             if not isinstance(item,dict) or not {'tipo','titulo','payload'} <= item.keys():raise Invalid('extração incompleta')
@@ -491,7 +862,8 @@ class Knowledge:
         def resolve(value):
             if isinstance(value,dict):
                 if value.get('record_id') in mapping:
-                    if value.get('revision',1)!=1:raise Invalid('revisão de placeholder inválida')
+                    rev=value.get('revision',1)
+                    if type(rev) is not int or rev!=1:raise Invalid('revisão de placeholder inválida')
                     return dict(value,**mapping[value['record_id']])
                 return {k:resolve(v) for k,v in value.items()}
             if isinstance(value,list):return [resolve(x) for x in value]

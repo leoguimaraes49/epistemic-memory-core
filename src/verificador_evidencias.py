@@ -3,7 +3,7 @@
 O caller fornece o hash de um manifesto confiável por fora do artefato. Isso
 não autentica o produtor nem prova que dados registrados sejam verdade no mundo.
 """
-import argparse,hashlib,json,sys
+import argparse,hashlib,json,re,sys
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -40,16 +40,23 @@ def strict(text):
 
 def pointer(value,path):
     if not isinstance(path,str) or not path.startswith('/') or len(path)>500:raise Refusal('invalid_path')
-    for part in path[1:].split('/'):
-        part=part.replace('~1','/').replace('~0','~')
+    for raw_part in path[1:].split('/'):
+        if '~' in raw_part and re.search(r'~(?![01])',raw_part):raise Refusal('invalid_path')
+        part=raw_part.replace('~1','/').replace('~0','~')
         if isinstance(value,dict) and part in value:value=value[part]
-        elif isinstance(value,list) and part.isdigit() and int(part)<len(value):value=value[int(part)]
+        elif isinstance(value,list) and re.fullmatch(r'0|[1-9][0-9]*',part):
+            idx=int(part)
+            if idx<len(value):value=value[idx]
+            else:raise Refusal('missing_value')
         else:raise Refusal('missing_value')
     return value
 
 def read_ref(reference,evidence,manifest):
+    if not isinstance(reference,dict):raise Refusal('invalid_claim_references')
     if not valid_revision(reference.get('revision')):raise Refusal('invalid_reference_revision')
-    ident=reference.get('record_id');meta=manifest['records'].get(ident)
+    ident=reference.get('record_id')
+    if not isinstance(ident,str) or not ident:raise Refusal('unknown_reference')
+    meta=manifest['records'].get(ident)
     if not meta:raise Refusal('unknown_reference')
     if reference.get('revision')!=meta['revision'] or ident in manifest.get('stale_ids',[]):raise Refusal('stale_reference')
     record=evidence.get(ident)
@@ -57,7 +64,7 @@ def read_ref(reference,evidence,manifest):
     if record['record_type']!='source':raise Refusal('derived_is_not_primary')
     try:data=strict(record['payload']['content'])
     except (ValueError,KeyError,TypeError):raise Refusal('unstructured_source')
-    return pointer(data,reference['path'])
+    return pointer(data,reference.get('path'))
 
 def assess_claim(claim,evidence,manifest):
     refs=claim.get('refs',[])
@@ -75,17 +82,22 @@ def assess_claim(claim,evidence,manifest):
             if not values or any(type(x)is not int for x in values):raise Refusal('not_integer_operands')
             expected=0
             for value in values:expected+=value
+            try:encode(expected)
+            except (ValueError,OverflowError) as err:raise Refusal('integer_overflow') from err
         else:
-            if len(values)<2 or any(not isinstance(v,list) or len(v)!=3 or any(type(x)is not str for x in v) for v in values):raise Refusal('invalid_chain')
+            if len(values)<2 or any(not isinstance(v,list) or len(v)!=3 or any(type(x)is not str or not x for x in v) for v in values):raise Refusal('invalid_chain')
             predicate=values[0][1]
             if predicate not in manifest['policy']['transitive_predicates']:raise Refusal('unregistered_rule')
             if any(v[1]!=predicate for v in values) or any(a[2]!=b[0] for a,b in zip(values,values[1:])):raise Refusal('disconnected_chain')
+            nodes=[values[0][0]]+[v[2] for v in values]
+            if len(set(nodes))!=len(nodes):raise Refusal('cyclic_chain')
             expected=[values[0][0],predicate,values[-1][2]]
         valid=same_json(expected,claim.get('value'))
         return {'id':claim.get('id'),'status':'verified_as_recorded' if valid else 'unsupported_value',
                 'needed':sorted({ref['record_id'] for ref in refs})}
     except Refusal as error:
-        return {'id':claim.get('id'),'status':str(error),'needed':sorted({r.get('record_id','') for r in refs})}
+        needed_ids=sorted({r['record_id'] for r in refs if isinstance(r,dict) and isinstance(r.get('record_id'),str) and r['record_id']})
+        return {'id':claim.get('id'),'status':str(error),'needed':needed_ids}
 
 @dataclass(frozen=True)
 class ManifestContext:
@@ -99,13 +111,18 @@ class ManifestContext:
 
 
 def prepare_manifest(manifest,anchor,scope):
-    if sha(manifest)!=anchor or manifest.get('scope')!=scope:raise Refusal('untrusted_or_changed_manifest')
-    if any(not isinstance(key,str) or not isinstance(meta,dict) or not valid_revision(meta.get('revision'))
+    if not isinstance(manifest,dict) or sha(manifest)!=anchor or manifest.get('scope')!=scope:raise Refusal('untrusted_or_changed_manifest')
+    if not isinstance(manifest.get('records'),dict) or any(not isinstance(key,str) or not isinstance(meta,dict) or not valid_revision(meta.get('revision'))
            for key,meta in manifest['records'].items()):raise Refusal('invalid_manifest_revision')
+    raw_policy=manifest.get('policy')
+    if (not isinstance(raw_policy,dict) or type(raw_policy.get('max_claims'))is not int or raw_policy['max_claims']<0
+            or not isinstance(raw_policy.get('transitive_predicates'),(list,tuple))
+            or any(type(p)is not str for p in raw_policy['transitive_predicates'])):
+        raise Refusal('invalid_manifest_policy')
     # Copiar valores primitivos e congelar os mapas: o caller não pode mudar a entrada validada por aliasing.
     records=MappingProxyType({key:MappingProxyType(dict(value)) for key,value in manifest['records'].items()})
-    policy=MappingProxyType({'transitive_predicates':tuple(manifest['policy']['transitive_predicates']),
-                             'max_claims':manifest['policy']['max_claims']})
+    policy=MappingProxyType({'transitive_predicates':tuple(raw_policy['transitive_predicates']),
+                             'max_claims':raw_policy['max_claims']})
     return ManifestContext(anchor,scope,records,frozenset(manifest.get('stale_ids',[])),policy)
 
 
@@ -120,9 +137,10 @@ def verify(packet,expected_anchor,expected_scope,context=None):
                 raise Refusal('context_anchor_mismatch')
             manifest=context
         else:
-            manifest=packet['manifest']
-            if sha(manifest)!=expected_anchor:raise Refusal('untrusted_or_changed_manifest')
-            if manifest['scope']!=expected_scope:raise Refusal('manifest_scope_mismatch')
+            raw_manifest=packet['manifest']
+            if not isinstance(raw_manifest,dict) or sha(raw_manifest)!=expected_anchor:raise Refusal('untrusted_or_changed_manifest')
+            if raw_manifest.get('scope')!=expected_scope:raise Refusal('manifest_scope_mismatch')
+            manifest=prepare_manifest(raw_manifest,expected_anchor,expected_scope)
         body={k:v for k,v in packet.items() if k!='receipt_sha256'}
         if sha(body)!=packet.get('receipt_sha256'):raise Refusal('receipt_changed')
         evidence=packet['evidence']

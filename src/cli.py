@@ -42,6 +42,9 @@ def main():
     ler_parser = subparsers.add_parser("ler-fonte")
     ler_parser.add_argument("record_id")
 
+    linhagem_parser = subparsers.add_parser("linhagem")
+    linhagem_parser.add_argument("record_id")
+
     reg_parser = subparsers.add_parser("registrar-fonte")
     reg_parser.add_argument("--key", required=True)
     reg_parser.add_argument("--titulo", required=True)
@@ -76,6 +79,16 @@ def main():
         res = p.listar_fontes()
     elif args.cmd == "ler-fonte":
         res = p.ler_fonte(args.record_id)
+    elif args.cmd == "linhagem":
+        if not p.authorized():
+            res = p.blocked()
+        else:
+            try:
+                from conhecimento import Knowledge
+                from nucleo import Conflict, Invalid, Locked, Uncertain
+                res = Knowledge(p.store).lineage(args.record_id)
+            except (Conflict, Uncertain, Locked, Invalid, OSError, ValueError, KeyError, TypeError) as e:
+                res = p.error(e)
     elif args.cmd == "registrar-fonte":
         res = p.registrar_fonte(args.key, args.titulo, args.conteudo)
     elif args.cmd == "retificar-fonte":

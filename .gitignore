@@ -22,8 +22,10 @@ estado/
 modelos/
 *.onnx
 
-# Cofre local gerado pelo usuário
+# Cofres e workspaces locais gerados pelo usuário
 meu-cofre/
+meu-dossie/
+my-dossier/
 
 # Diretorios temporarios de testes
 testes_temporarios/*

@@ -1,5 +1,5 @@
 """Busca lexical, semântica local e grafo; cache vinculado à geração observada."""
-import array,hashlib,json,sqlite3,sys
+import array,hashlib,json,math,sqlite3,struct,sys
 from pathlib import Path
 from contextlib import contextmanager
 from nucleo import Invalid,Conflict,canon,sha,NOW
@@ -12,46 +12,98 @@ def _pack_vector(vector):
     return arr.tobytes()
 
 
-def _unpack_vector(raw):
-    if isinstance(raw,(bytes,bytearray,memoryview)):
-        arr=array.array('d')
-        arr.frombytes(bytes(raw))
-        if sys.byteorder!='little':arr.byteswap()
-        return arr
-    return json.loads(raw)
+def _unpack_vector(raw,expected_dim=None):
+    try:
+        if isinstance(raw,(bytes,bytearray,memoryview)):
+            buf=bytes(raw)
+            if not buf or len(buf)%8!=0:
+                return None
+            arr=array.array('d')
+            arr.frombytes(buf)
+            if sys.byteorder!='little':arr.byteswap()
+            if expected_dim is not None and len(arr)!=expected_dim:
+                return None
+            if not all(math.isfinite(x) for x in arr):
+                return None
+            return arr
+        if isinstance(raw,str):
+            parsed=json.loads(raw)
+            if not isinstance(parsed,list) or not parsed:
+                return None
+            if expected_dim is not None and len(parsed)!=expected_dim:
+                return None
+            arr=array.array('d')
+            for x in parsed:
+                if type(x) not in (int,float):
+                    return None
+                fx=float(x)
+                if not math.isfinite(fx):
+                    return None
+                arr.append(fx)
+            return arr
+        return None
+    except (ValueError,TypeError,OverflowError,struct.error):
+        return None
 
 
 def _score_vectors(eligible_rows,queries):
     if not eligible_rows or not queries:return {}
+    valid_queries=[]
+    dim=None
+    for q in queries:
+        if not isinstance(q,(list,tuple,array.array)) or not q:
+            continue
+        try:
+            qf=[float(x) for x in q]
+        except (TypeError,ValueError,OverflowError):
+            continue
+        if not all(math.isfinite(x) for x in qf):
+            continue
+        if dim is None:
+            dim=len(qf)
+        elif len(qf)!=dim:
+            continue
+        valid_queries.append(qf)
+    if not valid_queries or not dim:
+        return {}
     np=sys.modules.get('numpy')
     if np is not None:
         try:
-            q_mat=np.asarray(queries,dtype=np.float64)
-            if q_mat.ndim==2 and q_mat.shape[1]>0:
-                dim=q_mat.shape[1]
+            q_mat=np.asarray(valid_queries,dtype=np.float64)
+            if q_mat.ndim==2 and q_mat.shape[1]==dim:
                 fast_ids=[];fast_vecs=[];fallback=[]
                 for ident,raw in eligible_rows:
                     if isinstance(raw,(bytes,bytearray,memoryview)) and len(raw)==dim*8:
-                        fast_ids.append(ident);fast_vecs.append(np.frombuffer(raw,dtype='<f8'))
+                        vec=np.frombuffer(raw,dtype='<f8')
+                        if np.isfinite(vec).all():
+                            fast_ids.append(ident);fast_vecs.append(vec)
                     else:
-                        fallback.append((ident,_unpack_vector(raw)))
+                        unpacked=_unpack_vector(raw,expected_dim=dim)
+                        if unpacked is not None:
+                            fallback.append((ident,unpacked))
                 scores={}
                 if fast_vecs:
                     mat=np.vstack(fast_vecs)
                     max_per_row=(mat @ q_mat.T).max(axis=1)
                     for ident,val in zip(fast_ids,max_per_row.tolist()):
-                        scores[ident]=max(scores.get(ident,float('-inf')),float(val))
+                        fval=float(val)
+                        if math.isfinite(fval):
+                            scores[ident]=max(scores.get(ident,float('-inf')),fval)
                 for ident,vec in fallback:
-                    val=max(sum(a*b for a,b in zip(vec,q)) for q in queries)
-                    scores[ident]=max(scores.get(ident,float('-inf')),val)
+                    val=max(sum(a*b for a,b in zip(vec,q)) for q in valid_queries)
+                    if math.isfinite(val):
+                        scores[ident]=max(scores.get(ident,float('-inf')),val)
                 return scores
-        except (TypeError,ValueError):
+        except (TypeError,ValueError,struct.error):
             pass
     scores={}
     for ident,raw in eligible_rows:
-        vector=_unpack_vector(raw)
-        score=max(sum(a*b for a,b in zip(vector,q)) for q in queries)
-        scores[ident]=max(scores.get(ident,float('-inf')),score)
+        vector=_unpack_vector(raw,expected_dim=dim)
+        if vector is None:
+            continue
+        score=max(sum(a*b for a,b in zip(vector,q)) for q in valid_queries)
+        if math.isfinite(score):
+            scores[ident]=max(scores.get(ident,float('-inf')),score)
     return scores
 
 
@@ -116,12 +168,25 @@ class Retrieval:
         exact=list(dict.fromkeys(r['id'] for r in lexical['results'] if r['id'] in eligible))
         semantic=[]
         if self.embedder and eligible:
-            with self.connect() as c:existing={r[0]:r[1] for r in c.execute('SELECT DISTINCT id,digest FROM vectors')}
+            queries=self.embedder.chunks(query,'query')
+            expected_dim=len(queries[0]) if queries and queries[0] else None
+            with self.connect() as c:
+                stored_rows=c.execute('SELECT id,part,digest,value FROM vectors ORDER BY id,part').fetchall()
+            grouped={}
+            for row_id,part,row_digest,raw_val in stored_rows:
+                grouped.setdefault(row_id,[]).append((part,row_digest,raw_val))
             updates={}
             for ident,record in eligible.items():
                 text=record['title']+'\n'+canon(record['payload']);digest=sha(text.encode())
-                if existing.get(ident)!=digest:updates[ident]=(digest,self.embedder.chunks(text))
-            stale_ids=set(existing)-set(eligible)
+                existing_parts=grouped.get(ident)
+                valid_stored=(
+                    bool(existing_parts)
+                    and [p for p,_,_ in existing_parts]==list(range(len(existing_parts)))
+                    and all(d==digest and _unpack_vector(v,expected_dim=expected_dim) is not None for _,d,v in existing_parts)
+                )
+                if not valid_stored:
+                    updates[ident]=(digest,self.embedder.chunks(text))
+            stale_ids=set(grouped)-set(eligible)
             if updates or stale_ids:
                 if self.snapshot()[0]!=generation:raise Conflict('base mudou durante atualização do índice')
                 with self.connect() as c:
@@ -133,9 +198,7 @@ class Retrieval:
                     c.execute('INSERT OR REPLACE INTO metadata VALUES(?,?)',('generation',generation))
                     vectors=list(c.execute('SELECT id,value FROM vectors'))
             else:
-                with self.connect() as c:
-                    vectors=list(c.execute('SELECT id,value FROM vectors'))
-            queries=self.embedder.chunks(query,'query')
+                vectors=[(row_id,raw_val) for row_id,_,_,raw_val in stored_rows]
             eligible_rows=[(ident,raw) for ident,raw in vectors if ident in eligible]
             scores=_score_vectors(eligible_rows,queries)
             semantic=sorted(scores,key=lambda i:(-scores[i],i))[:limit]

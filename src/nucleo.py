@@ -1,5 +1,5 @@
 """Núcleo local: uma fonte por arquivo, com controle de concorrência por plataforma."""
-import errno, hashlib, json, os, re, sqlite3, stat, time, uuid
+import errno, hashlib, json, os, re, sqlite3, stat, time, unicodedata, uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,18 +111,40 @@ def parse(b):
     m=re.match(r'\A---\n(.*?)\n---\n```brain-json\n(.*?)\n```\n\Z',b.decode('utf-8'),re.S)
     if not m:raise Invalid('nota não corresponde ao formato controlado')
     h={}
-    for line in m.group(1).splitlines():
+    for line in m.group(1).split('\n'):
         k,sep,v=line.partition(': ')
         if not sep or k in h:raise Invalid('cabeçalho inválido')
         h[k]=json.loads(v)
     h['payload']=json.loads(m.group(2)); return h
 
+def _has_surrogate(text):
+    return any(0xD800 <= ord(c) <= 0xDFFF for c in text)
+
+
+def _has_visible_text(text):
+    return (isinstance(text, str) and '\x00' not in text and not _has_surrogate(text)
+            and any(unicodedata.category(c)[0] not in ('C', 'Z', 'M') for c in text))
+
+
 def filename(title,ident,existing):
-    t=re.sub(r'[<>:"/\\|?*\x00-\x1f]',' ',title).strip(' .')
-    t=re.sub(r'\s+',' ',t)[:90].rstrip(' .')
-    if not t or re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[1-9\xb9\xb2\xb3]|LPT[1-9\xb9\xb2\xb3])',t,re.I): t='Fonte'
+    raw=unicodedata.normalize('NFC',str(title or ''))
+    cleaned=''.join('' if unicodedata.category(c)=='Cf'
+                    else (' ' if unicodedata.category(c) in ('Cc','Zl','Zp','Cs') or c in '<>:"/\\|?*' else c)
+                    for c in raw)
+    t=unicodedata.normalize('NFC',re.sub(r'\s+',' ',cleaned).strip(' .'))
+    while t and (unicodedata.category(t[0]).startswith('M') or t[0] in ' .'):
+        t=t[1:]
+    t=unicodedata.normalize('NFC',t)[:90].rstrip(' .')
+    stem=t.split('.',1)[0].strip(' .')
+    if not t or re.fullmatch(r'(?:CON|PRN|AUX|NUL|CLOCK\$|COM[0-9\xb9\xb2\xb3]|LPT[0-9\xb9\xb2\xb3])',stem,re.I): t='Fonte'
     name=t+'.md'
-    if name.casefold() in {x.casefold() for x in existing}: name=f'{t} — {ident[:8]}.md'
+    folded={unicodedata.normalize('NFC',str(x)).casefold() for x in existing if isinstance(x,str)}
+    if name.casefold() in folded:
+        short=re.sub(r'[^A-Za-z0-9_-]','',str(ident))[:8] or 'id'
+        name=f'{t} — {short}.md'
+        seq=2
+        while name.casefold() in folded:
+            name=f'{t} — {short}-{seq}.md'; seq+=1
     return name
 
 class Store:
@@ -145,6 +167,9 @@ class Store:
             with c:yield c
         finally:c.close()
     def safe_path(self,name):
+        if (not isinstance(name,str) or not name or '\x00' in name or _has_surrogate(name)
+                or '/' in name or '\\' in name or name in ('.','..')):
+            raise Invalid('caminho fora da pasta controlada')
         p=(self.folder/name).resolve()
         if p.parent!=self.folder.resolve() or p.name!=name or p.is_symlink(): raise Invalid('caminho fora da pasta controlada')
         return p
@@ -156,18 +181,38 @@ class Store:
             if c.execute('SELECT 1 FROM tombstones WHERE record_id=?',(ident,)).fetchone():raise Invalid('registro excluído ou em exclusão')
             r=c.execute('SELECT filename,revision,digest FROM records WHERE id=?',(ident,)).fetchone()
         if not r:raise Invalid('registro não encontrado')
-        b=read_exclusive(self.safe_path(r[0]))
-        if sha(b)!=r[2]:raise Conflict('edição externa detectada; reconciliação necessária')
+        fname,rev,digest=r
+        b=read_exclusive(self.safe_path(fname))
+        if sha(b)!=digest:
+            with self.connect() as c:
+                if c.execute('SELECT 1 FROM tombstones WHERE record_id=?',(ident,)).fetchone():raise Invalid('registro excluído ou em exclusão')
+                fresh=c.execute('SELECT filename,revision,digest FROM records WHERE id=?',(ident,)).fetchone()
+            if not fresh or fresh[0]!=fname or sha(b)!=fresh[2]:
+                raise Conflict('edição externa detectada; reconciliação necessária')
+            rev,digest=fresh[1],fresh[2]
         n=parse(b)
-        if n['id']!=ident or n['revision']!=r[1]:raise Conflict('identidade ou revisão divergente')
+        if n['id']!=ident or n['revision']!=rev:raise Conflict('identidade ou revisão divergente')
         return n
     def read_all(self):
         with self.connect() as c:
             rows=c.execute('SELECT id,filename,revision,digest FROM records WHERE id NOT IN (SELECT record_id FROM tombstones) ORDER BY filename').fetchall()
         result=[]
         for ident,fname,rev,digest in rows:
-            b=read_exclusive(self.safe_path(fname))
-            if sha(b)!=digest:raise Conflict('edição externa detectada; reconciliação necessária')
+            try:
+                b=read_exclusive(self.safe_path(fname))
+            except FileNotFoundError:
+                with self.connect() as c:
+                    if c.execute('SELECT 1 FROM tombstones WHERE record_id=?',(ident,)).fetchone():
+                        continue
+                raise Conflict('edição externa detectada; reconciliação necessária')
+            if sha(b)!=digest:
+                with self.connect() as c:
+                    if c.execute('SELECT 1 FROM tombstones WHERE record_id=?',(ident,)).fetchone():
+                        continue
+                    fresh=c.execute('SELECT filename,revision,digest FROM records WHERE id=?',(ident,)).fetchone()
+                if not fresh or fresh[0]!=fname or sha(b)!=fresh[2]:
+                    raise Conflict('edição externa detectada; reconciliação necessária')
+                rev,digest=fresh[1],fresh[2]
             n=parse(b)
             if n['id']!=ident or n['revision']!=rev:raise Conflict('identidade ou revisão divergente')
             result.append(n)
@@ -188,10 +233,10 @@ class Store:
             raise Conflict('identidade ou revisão da fonte de origem divergente')
 
     def apply(self,key,kind,title='',text='',ident='',expected=0,reason='',source_metadata=None):
-        if not re.fullmatch('[A-Za-z0-9_-]{1,80}',key):raise Invalid('chave inválida')
-        if kind not in ('create','correct') or not text.strip() or len(text)>20000:raise Invalid('conteúdo ou operação inválidos')
-        if kind=='create' and (not title.strip() or len(title)>120):raise Invalid('título inválido')
-        if kind=='correct' and (not reason.strip() or len(reason)>500):raise Invalid('motivo de correção obrigatório')
+        if not isinstance(key,str) or not re.fullmatch('[A-Za-z0-9_-]{1,80}',key):raise Invalid('chave inválida')
+        if kind not in ('create','correct') or not _has_visible_text(text) or len(text)>20000:raise Invalid('conteúdo ou operação inválidos')
+        if kind=='create' and (not _has_visible_text(title) or len(title)>120):raise Invalid('título inválido')
+        if kind=='correct' and (not _has_visible_text(reason) or len(reason)>500):raise Invalid('motivo de correção obrigatório')
         req={'kind':kind,'title':title,'text':text,'id':ident,'expected':expected,'reason':reason}
         if source_metadata is not None:
             from documentos import validate_metadata
@@ -213,6 +258,8 @@ class Store:
                     name=filename(title,ident,names); oldhash=None; created=NOW()
                     n={'id':ident,'record_type':'source','schema_version':'0.1','revision':1,'title':title,'created_at':created,'updated_at':created,'created_by':'ponte_local','access_policy_ref':'proprietario_local','lifecycle_status':'active','payload_format':'brain_json_v1','payload':{'source_kind':'conversation','origin_description':'Relato fornecido à ponte pelo usuário','received_at':created,'availability_status':'retained','retention_conditions':'cofre pessoal local','content_locator':'payload.content','content':text}}
                 else:
+                    if c.execute("SELECT 1 FROM operations WHERE record_id=? AND status!='confirmed'",(ident,)).fetchone():
+                        raise Conflict('operação pendente para este registro; reconciliar antes de repetir')
                     r=c.execute('SELECT filename,revision,digest FROM records WHERE id=?',(ident,)).fetchone()
                     if not r or type(expected)!=int or r[1]!=expected:raise Conflict('revisão esperada não corresponde')
                     name,_,oldhash=r
@@ -256,20 +303,29 @@ class Store:
                         hist=(self.hist/ident); hist.mkdir(exist_ok=True); dest=hist/(str(expected)+'.md')
                         if dest.exists() and sha(dest.read_bytes())!=oldhash:raise Conflict('histórico divergente')
                         if not dest.exists():
-                            with dest.open('xb') as h:h.write(old);h.flush();os.fsync(h.fileno())
+                            tmp_hist=hist/f'{expected}.md.tmp-{uuid.uuid4().hex}'
+                            try:
+                                with tmp_hist.open('xb') as h:h.write(old);h.flush();os.fsync(h.fileno())
+                                os.replace(tmp_hist,dest)
+                            except BaseException:
+                                if tmp_hist.exists():
+                                    try:tmp_hist.unlink()
+                                    except OSError:pass
+                                raise
                     if os.name != 'nt':
                         verify_posix_file(path, fd, old)
                     f.seek(0); f.write(data); f.truncate(); f.flush(); os.fsync(fd)
                 if os.name != 'nt':
                     verify_posix_file(path, fd, data)
-            result={'status':'confirmed','id':ident,'revision':expected+1}
-            if row is None:c.execute('INSERT INTO records VALUES(?,?,?,?)',(ident,name,expected+1,newhash))
-            else:c.execute('UPDATE records SET revision=?,digest=? WHERE id=?',(expected+1,newhash,ident))
-            c.execute('UPDATE operations SET status=?,pending=NULL,result=? WHERE key=?',('confirmed',json.dumps(result),key))
+                result={'status':'confirmed','id':ident,'revision':expected+1}
+                if row is None:c.execute('INSERT INTO records VALUES(?,?,?,?)',(ident,name,expected+1,newhash))
+                else:c.execute('UPDATE records SET revision=?,digest=? WHERE id=?',(expected+1,newhash,ident))
+                c.execute('UPDATE operations SET status=?,pending=NULL,result=? WHERE key=?',('confirmed',json.dumps(result),key))
+                c.commit()
             return result
 
     def delete(self,key,ident,expected):
-        if not re.fullmatch('[A-Za-z0-9_-]{1,80}',key) or type(expected)!=int or expected<1:raise Invalid('pedido de exclusão inválido')
+        if not isinstance(key,str) or not re.fullmatch('[A-Za-z0-9_-]{1,80}',key) or type(expected)!=int or expected<1:raise Invalid('pedido de exclusão inválido')
         fingerprint=sha(canon({'kind':'delete','id':ident,'expected':expected}).encode())
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
@@ -298,7 +354,8 @@ class Store:
             if hist.exists():
                 if hist.is_symlink() or hist.resolve().parent!=self.hist.resolve():raise Invalid('histórico fora do escopo')
                 for p in hist.iterdir():
-                    if p.is_symlink() or not p.is_file() or not re.fullmatch(r'[1-9][0-9]*\.md',p.name):raise Invalid('arquivo inesperado no histórico')
+                    if p.is_symlink() or not p.is_file() or not re.fullmatch(r'(?:[1-9][0-9]*\.md|[1-9][0-9]*\.md\.tmp(?:-[A-Za-z0-9_-]+)?)',p.name):
+                        raise Invalid('arquivo inesperado no histórico')
                     p.unlink()
                 hist.rmdir()
             c.execute('UPDATE operations SET pending=NULL WHERE record_id=?',(ident,))

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "epistemic-memory-core"
-version = "0.5.7"
-description = "Motor determinístico de memória estruturada, auditoria de premissas e verificação de evidências para agentes de IA via MCP."
+version = "0.5.8"
+description = "Motor determinístico de memória estruturada, auditoria de premissas e verificação de evidências para agentes de IA via MCP, SDK Python e Gateway HTTP."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -25,9 +25,12 @@ emc = "cli:main"
 emc-mcp = "ponte_pessoal:run_server"
 emc-dashboard = "dashboard:main"
 emc-verifier = "verificador_evidencias:main"
+emc-dossie = "apps.dossie_studio.cli:main"
+emc-gateway = "apps.http_gateway.cli:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src", "apps" = "apps", "apps.dossie_studio" = "apps/dossie_studio", "apps.agent_memory_sdk" = "apps/agent_memory_sdk", "apps.http_gateway" = "apps/http_gateway" }
+packages = ["apps", "apps.dossie_studio", "apps.agent_memory_sdk", "apps.http_gateway"]
 py-modules = [
     "apoio_decisao", "atribuicao", "autonomia", "autoteste", "avaliacoes",
     "cli", "conhecimento", "coordenador", "dashboard", "documentos",
@@ -38,6 +41,6 @@ py-modules = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 python_files = ["testes*.py"]
