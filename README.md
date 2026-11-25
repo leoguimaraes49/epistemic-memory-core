@@ -2,7 +2,7 @@
 
 > **Motor transacional de memória estruturada, governança de premissas, verificação determinística de alegações e busca híbrida local em SQLite + Markdown — utilizável diretamente via CLI e aplicações web locais ou conectado opcionalmente a agentes via MCP, SDK Python e Gateway HTTP/REST.**
 
-🇺🇸 [Read in English](README.en.md) · [Epistemic Dossier Studio](apps/dossie_studio/README.md) · [Agent Memory SDK](apps/agent_memory_sdk/README.md) · [HTTP Gateway](apps/http_gateway/README.md) · [Manual Normativo (17 Capítulos)](00_Manual/indice-manual-cerebro.md) · [Arquitetura Detalhada](docs/guias/ARQUITETURA.md)
+🇺🇸 [Read in English](README.en.md) · [Epistemic Dossier Studio](apps/dossie_studio/README.md) · [Agent Memory SDK](apps/agent_memory_sdk/README.md) · [HTTP Gateway](apps/http_gateway/README.md) · [Manual Normativo (17 Capítulos)](00_Manual/indice-manual-cerebro.md) · [Arquitetura Detalhada](docs/guias/ARQUITETURA.md) · [Privacy Policy](PRIVACY.md) · [Security](SECURITY.md)
 
 [![CI](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml/badge.svg)](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml)
 [![M8ven Score](https://m8ven.ai/badge/mcp/leoguimaraes49-epistemic-memory-core-19kbfa?v=61b230699d7b3e147b2f0bc30c189d6e)](https://m8ven.ai/mcp/leoguimaraes49-epistemic-memory-core-19kbfa?s=readme)
@@ -128,6 +128,7 @@ Veja também os guias operacionais de [Execução](docs/guias/EXECUCAO.md), [Aut
 ├── src/                         # Motor epistêmico (25 módulos Python + pacote emc_resources no build wheel)
 ├── tests/                       # 28 suítes oficiais (autoteste) + 2 scripts MCP de regressão
 ├── LICENSE                      # Licença Non-Commercial Source-Available de autoria exclusiva
+├── PRIVACY.md / SECURITY.md     # Política de privacidade local-first e política de segurança
 ├── pyproject.toml / setup.py    # Pacote v0.5.9, recursos wheel e 6 CLIs (emc, emc-mcp, emc-dashboard, emc-verifier, emc-dossie, emc-gateway)
 └── requirements-execucao04.txt  # Dependências Python fixadas por versão
 ```
@@ -160,4 +161,5 @@ $env:CEREBRO_PESSOAL_ACESSO = "permitido"
 
 - **Garantias físicas e de protocolo:** integridade por `SHA-256`, cadeias auditáveis de revisão, travas exclusivas por plataforma retidas até o `COMMIT` SQLite (`CreateFileW dwShareMode=0` no Windows; `flock` + `verify_posix_file` em Linux/macOS — veja [Garantias de Execução](00_Manual/manual-cerebro-15-garantias-de-execucao.md#arquivos-controlados-por-plataforma)), validação de escopo pré-escrita e recibos `lab-assurance-2` verificáveis sem LLM.
 - **Limites conscientes:** o sistema não inventa diagnósticos nem perfis inferidos, não emite probabilidades sem base empírica, não transmite relatos locais para serviços externos não autorizados e jamais executa autoalteração arbitrária de código ou escalação de privilégios.
+- **Privacidade e segurança:** processamento local-first sem telemetria ([`PRIVACY.md`](PRIVACY.md)) e reporte responsável de vulnerabilidades ([`SECURITY.md`](SECURITY.md)), com *rate limiting* em janela deslizante nas superfícies MCP e HTTP locais.
 - **Licença:** distribuído sob licença **Non-Commercial Source-Available** ([`LICENSE`](LICENSE)) de autoria exclusiva de **Leonardo Guimarães (`@leoguimaraes49`)** — permitido para estudo, pesquisa acadêmica, auditoria técnica e uso estritamente pessoal sem fins lucrativos; vedado uso comercial, revenda ou oferta hospedada/SaaS sem autorização prévia por escrito do Autor.

@@ -2,9 +2,10 @@
 
 > **Deterministic transactional memory, premise governance, standard-library claim verification, and self-healing local hybrid search over SQLite + Markdown — usable directly via CLI and local web workbenches, or optionally connected to AI agents via MCP, Python SDK, and REST HTTP Gateway.**
 
-🇧🇷 [Leia em Português](README.md) · [Epistemic Dossier Studio](apps/dossie_studio/README.md) · [Agent Memory SDK](apps/agent_memory_sdk/README.md) · [HTTP Gateway](apps/http_gateway/README.md) · [Normative Manual (17 Chapters, PT-BR)](00_Manual/indice-manual-cerebro.md) · [Detailed Architecture (PT-BR)](docs/guias/ARQUITETURA.md)
+🇧🇷 [Leia em Português](README.md) · [Epistemic Dossier Studio](apps/dossie_studio/README.md) · [Agent Memory SDK](apps/agent_memory_sdk/README.md) · [HTTP Gateway](apps/http_gateway/README.md) · [Normative Manual (17 Chapters, PT-BR)](00_Manual/indice-manual-cerebro.md) · [Detailed Architecture (PT-BR)](docs/guias/ARQUITETURA.md) · [Privacy Policy](PRIVACY.md) · [Security](SECURITY.md)
 
 [![CI](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml/badge.svg)](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml)
+[![M8ven Score](https://m8ven.ai/badge/mcp/leoguimaraes49-epistemic-memory-core-19kbfa?v=61b230699d7b3e147b2f0bc30c189d6e)](https://m8ven.ai/mcp/leoguimaraes49-epistemic-memory-core-19kbfa?s=readme)
 [![Python 3.11 | 3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![MCP 1.26](https://img.shields.io/badge/protocol-MCP%201.26%20%7C%20SDK%20%7C%20REST-purple.svg)](https://modelcontextprotocol.io/)
 [![ONNX Local](https://img.shields.io/badge/embeddings-E5--multilingual%20(ONNX%20Local)-green.svg)](https://github.com/microsoft/onnxruntime)
@@ -127,6 +128,7 @@ See also the operational guides (PT-BR): [Execution 0.2](docs/guias/EXECUCAO.md)
 ├── src/                         # Core transactional engine (25 Python modules + emc_resources in wheel builds)
 ├── tests/                       # 28 official automated test suites + 2 standalone MCP regression scripts
 ├── LICENSE                      # Custom Non-Commercial Source-Available License
+├── PRIVACY.md / SECURITY.md     # Local-first privacy policy and security policy
 ├── pyproject.toml / setup.py    # v0.5.9 metadata, wheel resources & 6 CLI entrypoints (emc, emc-mcp, emc-dashboard, emc-verifier, emc-dossie, emc-gateway)
 └── requirements-execucao04.txt  # Pinned Python dependencies
 ```
@@ -158,4 +160,5 @@ CEREBRO_PESSOAL_ACESSO=permitido ./.venv/bin/python scripts/stress_caos_concorre
 
 - **Implemented Controls:** raw-byte `SHA-256` verification, auditable revision chains, platform-specific exclusive file locks held across SQLite `COMMIT` (`CreateFileW dwShareMode=0` on Windows; `flock` + `verify_posix_file` on Linux/macOS — see [Execution Guarantees](00_Manual/manual-cerebro-15-garantias-de-execucao.md#arquivos-controlados-por-plataforma)), pre-mkdir scope validation, and LLM-free `lab-assurance-2` receipts.
 - **Explicit Non-Goals:** the system does not fabricate diagnoses or inferred profiles, does not emit unsupported probabilities, does not transmit local notes to unauthorized external services, and never performs arbitrary code self-modification or privilege escalation.
+- **Privacy & Security:** local-first processing with zero telemetry ([`PRIVACY.md`](PRIVACY.md)), responsible vulnerability reporting ([`SECURITY.md`](SECURITY.md)), and sliding-window rate limiting across local MCP and HTTP surfaces.
 - **License:** published under a custom **Non-Commercial Source-Available License** ([`LICENSE`](LICENSE)), authored exclusively by **Leonardo Guimarães (`@leoguimaraes49`)** — permitted for personal non-commercial use, academic research, educational study, and technical code auditing; commercial use, resale, and hosted/SaaS deployments require prior written authorization from the Author.

@@ -85,9 +85,9 @@ class ModelTests(unittest.TestCase):
             with self.assertRaises(Invalid):TextModel(self.root/'state',self.cfg,1).call('prompt')
     def test_no_paid_key_or_user_plugins_are_forwarded(self):
         seen=[];events=[{'type':'item.completed','item':{'type':'agent_message','text':'{}'}},{'type':'turn.completed'}]
-        with patch.dict('os.environ',{'OPENAI_API_KEY':'ficticio'}),patch('provedores.subprocess.Popen',self.child(events,seen)):
+        with patch.dict('os.environ',{'OPENAI_API_KEY':'ficticio','EMC_GATEWAY_TOKEN':'token-ficticio'}),patch('provedores.subprocess.Popen',self.child(events,seen)):
             TextModel(self.root/'state',self.cfg,1).call('prompt')
-        args,kwargs=seen[0];self.assertNotIn('OPENAI_API_KEY',kwargs['env']);self.assertIn('--ignore-user-config',args)
+        args,kwargs=seen[0];self.assertNotIn('OPENAI_API_KEY',kwargs['env']);self.assertNotIn('EMC_GATEWAY_TOKEN',kwargs['env']);self.assertIn('--ignore-user-config',args)
         self.assertIn('multi_agent',args);self.assertIn('web_search="disabled"',args)
     def test_disabled_provider_does_not_spawn_a_process(self):
         with patch('provedores.subprocess.Popen') as spawn:
@@ -173,11 +173,12 @@ class ClientResolutionTests(unittest.TestCase):
 
     def test_windows_signature_uses_system_modules_and_fails_closed(self):
         executable = self.binary('aaaaaaaa', 1)
-        with patch.dict(os.environ, {'PSModulePath': 'fixture'}), patch('provedores.subprocess.run') as run:
+        with patch.dict(os.environ, {'PSModulePath': 'fixture', 'EMC_GATEWAY_TOKEN': 'token-ficticio'}), patch('provedores.subprocess.run') as run:
             run.return_value = subprocess.CompletedProcess([], 0, b'verified\r\n', b'')
             self.assertTrue(_signed_by_openai(executable, 2))
             env = run.call_args.kwargs['env']
             self.assertFalse(any(key.upper() == 'PSMODULEPATH' for key in env))
+            self.assertFalse(any(key.upper() == 'EMC_GATEWAY_TOKEN' for key in env))
             self.assertEqual(env['EMC_CODEX_SIGNATURE_CANDIDATE'], str(executable))
             run.side_effect = subprocess.TimeoutExpired('fixture', 2)
             self.assertFalse(_signed_by_openai(executable, 2))

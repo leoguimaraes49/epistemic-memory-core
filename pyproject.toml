@@ -20,6 +20,13 @@ dependencies = [
     "tokenizers==0.23.3",
 ]
 
+[project.urls]
+Homepage = "https://github.com/leoguimaraes49/epistemic-memory-core"
+Repository = "https://github.com/leoguimaraes49/epistemic-memory-core"
+Issues = "https://github.com/leoguimaraes49/epistemic-memory-core/issues"
+Documentation = "https://github.com/leoguimaraes49/epistemic-memory-core/blob/main/docs/guias/ARQUITETURA.md"
+"Privacy Policy" = "https://github.com/leoguimaraes49/epistemic-memory-core/blob/main/PRIVACY.md"
+
 [project.scripts]
 emc = "cli:main"
 emc-mcp = "ponte_pessoal:run_server"

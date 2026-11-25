@@ -116,8 +116,42 @@ async def check():
                 await session.initialize()
                 denied = decoded(await session.call_tool('consultar_comprovante', {'receipt_id': result['receipt_id']}))
                 assert denied['status'] == 'denied'
+
+        import time
+        import ponte_pessoal as bridge
+        orig_limiter = bridge.rate_limiter
+        orig_store = bridge.store
+        orig_access = os.environ.get('CEREBRO_PESSOAL_ACESSO')
+        try:
+            os.environ['CEREBRO_PESSOAL_ACESSO'] = 'permitido'
+            bridge.store = sources
+            bridge.rate_limiter = bridge.RateLimiter(max_requests=2, window_seconds=0.25)
+            assert bridge.consultar_operacao('first')['status'] == 'confirmed'
+            assert bridge.consultar_operacao('first')['status'] == 'confirmed'
+            limited = bridge.consultar_operacao('first')
+            assert limited['status'] == 'rate_limited' and limited['error'] == 'rate_limit_exceeded'
+            # Ferramentas readOnlyHint=True permanecem puras e não sofrem mutação nem bloqueio do limitador
+            assert bridge.estado()['version'] == '0.5'
+            time.sleep(0.3)
+            assert bridge.consultar_operacao('first')['status'] == 'confirmed'
+            # Caminho de erro de processar_contribuicao retorna erro estruturado (sem UnboundLocalError)
+            invalid_contrib = bridge.processar_contribuicao('', '', '', [])
+            assert invalid_contrib['status'] == 'invalid'
+            # Cap de 1024 chaves ativas falha fechado
+            cap_limiter = bridge.RateLimiter(max_requests=1, window_seconds=60.0)
+            for idx in range(1024):
+                assert cap_limiter.allow(f'tool-{idx}')[0]
+            assert cap_limiter.allow('tool-overflow')[0] is False
+        finally:
+            bridge.rate_limiter = orig_limiter
+            bridge.store = orig_store
+            if orig_access is None:
+                os.environ.pop('CEREBRO_PESSOAL_ACESSO', None)
+            else:
+                os.environ['CEREBRO_PESSOAL_ACESSO'] = orig_access
+
         return {'status': 'passed', 'version': '0.5', 'scope': 'MCP e CLI reais em fixture fictícia',
-                'checks': ['tools', 'supplement', 'repeat', 'maintenance', 'wrong_sum', 'correction', 'stale', 'cli', 'access_denied'],
+                'checks': ['tools', 'supplement', 'repeat', 'maintenance', 'wrong_sum', 'correction', 'stale', 'cli', 'access_denied', 'rate_limit'],
                 'model_calls': 0}
 
 

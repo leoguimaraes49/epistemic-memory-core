@@ -112,6 +112,69 @@ class DossieStudioScenarioTests(unittest.TestCase):
         self.assertEqual(code_mut, 200)
         self.assertGreaterEqual(json.loads(raw_mut)['mutation']['total_stale_records'], 1)
 
+    def test_web_studio_rate_limiting_enforces_429_and_recovers(self):
+        import http.client
+        import time
+
+        server = create_studio_server(self.ws, host='127.0.0.1', port=0, rate_limit_requests=2, rate_limit_window_seconds=0.25)
+        port = server.server_address[1]
+        token = server.csrf_token
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close(), thread.join(timeout=3)))
+
+        def send(path, method='GET', body=None, headers=None):
+            raw = json.dumps(body).encode('utf-8') if isinstance(body, dict) else body
+            r = urllib.request.Request(f'http://127.0.0.1:{port}{path}', data=raw, headers=headers or {}, method=method)
+            try:
+                with urllib.request.urlopen(r, timeout=10) as resp:
+                    return resp.status, dict(resp.headers), resp.read().decode('utf-8')
+            except urllib.error.HTTPError as err:
+                return err.code, dict(err.headers), err.read().decode('utf-8')
+
+        self.assertEqual(send('/api/scenarios')[0], 200)
+        self.assertEqual(send('/api/scenarios')[0], 200)
+        code_429, hdrs_429, raw_429 = send('/api/scenarios')
+        self.assertEqual(code_429, 429)
+        self.assertGreaterEqual(int(hdrs_429.get('Retry-After', '0')), 1)
+        self.assertEqual(json.loads(raw_429)['error'], 'rate_limit_exceeded')
+
+        # POST com corpo JSON bloqueado por 429 deve drenar o corpo e responder JSON limpo sem TCP RST
+        post_code, post_hdrs, post_raw = send(
+            '/api/search',
+            method='POST',
+            body={'query': 'teste', 'padding': 'x' * 4096},
+            headers={'Content-Type': 'application/json', 'X-Dossie-Token': token, 'Origin': f'http://127.0.0.1:{port}'},
+        )
+        self.assertEqual(post_code, 429)
+        self.assertGreaterEqual(int(post_hdrs.get('Retry-After', '0')), 1)
+        self.assertEqual(post_hdrs.get('Connection', '').lower(), 'close')
+        self.assertEqual(json.loads(post_raw)['error'], 'rate_limit_exceeded')
+
+        time.sleep(0.3)
+        self.assertEqual(send('/api/scenarios')[0], 200)
+
+        # Transfer-Encoding sem Content-Length deve retornar 411
+        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        try:
+            conn.request(
+                'POST',
+                '/api/search',
+                body=b'2\r\n{}\r\n0\r\n\r\n',
+                headers={
+                    'Host': f'127.0.0.1:{port}',
+                    'Transfer-Encoding': 'chunked',
+                    'X-Dossie-Token': token,
+                    'Origin': f'http://127.0.0.1:{port}',
+                },
+            )
+            resp = conn.getresponse()
+            body_411 = json.loads(resp.read().decode('utf-8'))
+            self.assertEqual(resp.status, 411)
+            self.assertEqual(body_411['status'], 'invalid')
+        finally:
+            conn.close()
+
     def test_cli_commands_end_to_end(self):
         cli_ws = Path(self.tmp.name) / 'cli_ws'
         # Subprocess isolated CLI test because bootstrap_environment sets EMC_SYSTEM/EMC_VAULT

@@ -164,6 +164,58 @@ class DashboardHttpSecurityTests(unittest.TestCase):
         self.assertNotIn('__EMC_CSRF_TOKEN__', html)
         self.assertIn("frame-ancestors 'none'", headers.get('Content-Security-Policy', ''))
 
+    def test_rate_limiting_enforces_429_and_window_recovery(self):
+        import time
+
+        self.server.rate_limiter = dashboard.RateLimiter(max_requests=2, window_seconds=0.25)
+        code1, _, _ = self._request('/')
+        code2, _, _ = self._request('/')
+        self.assertEqual((code1, code2), (200, 200))
+
+        code_429, headers_429, raw_429 = self._request('/')
+        self.assertEqual(code_429, 429)
+        self.assertGreaterEqual(int(headers_429.get('Retry-After', '0')), 1)
+        self.assertEqual(headers_429.get('X-RateLimit-Limit'), '2')
+        self.assertEqual(headers_429.get('X-RateLimit-Remaining'), '0')
+        self.assertEqual(json.loads(raw_429)['error'], 'rate_limit_exceeded')
+
+        # POST com corpo JSON sob 429 deve drenar o corpo e responder JSON limpo
+        post_payload = json.dumps({'consulta': 'limite', 'padding': 'x' * 4096}).encode('utf-8')
+        post_code, post_headers, post_raw = self._request(
+            '/api/buscar',
+            method='POST',
+            body=post_payload,
+            headers={
+                'Content-Type': 'application/json',
+                'X-EMC-Token': dashboard.SESSION_TOKEN,
+                'Origin': f'http://127.0.0.1:{self.port}',
+            },
+        )
+        self.assertEqual(post_code, 429)
+        self.assertGreaterEqual(int(post_headers.get('Retry-After', '0')), 1)
+        self.assertEqual(json.loads(post_raw)['error'], 'rate_limit_exceeded')
+
+        time.sleep(0.3)
+        code_ok, _, _ = self._request('/')
+        self.assertEqual(code_ok, 200)
+
+        # Limite de 1024 chaves ativas falha fechado e recupera após expiração da janela
+        cap = dashboard.RateLimiter(max_requests=1, window_seconds=0.15)
+        for idx in range(1024):
+            self.assertTrue(cap.allow(f'k-{idx}')[0])
+        allowed_extra, rem_extra, retry_extra = cap.allow('k-overflow')
+        self.assertFalse(allowed_extra)
+        self.assertEqual(rem_extra, 0)
+        self.assertGreater(retry_extra, 0.0)
+        time.sleep(0.2)
+        self.assertTrue(cap.allow('k-overflow')[0])
+
+    def test_run_dashboard_validates_rate_limit_before_binding_socket(self):
+        with patch.object(dashboard, 'ThreadingHTTPServer') as srv_cls:
+            with self.assertRaises(ValueError):
+                dashboard.run_dashboard(port=0, rate_limit_requests=0)
+            srv_cls.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

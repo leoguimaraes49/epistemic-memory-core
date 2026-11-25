@@ -6,11 +6,14 @@ e execução concorrente via `ThreadingHTTPServer`.
 """
 from __future__ import annotations
 
+from collections import deque
 import json
+import math
 import os
 import re
 import secrets
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING
@@ -21,7 +24,55 @@ if TYPE_CHECKING:
     from .engine_adapter import DossieWorkspace
 
 MAX_BODY_BYTES = 65536
+_MAX_DRAIN_BYTES = 262144
+_DRAIN_CHUNK_BYTES = 16384
+DEFAULT_RATE_LIMIT_REQUESTS = 300
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60.0
 _ALLOWED_HOST_RE = re.compile(r"^(?:127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$", re.I)
+
+
+class RateLimiter:
+    """Limitador de taxa em janela deslizante thread-safe usando apenas stdlib."""
+
+    def __init__(
+        self,
+        max_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
+        window_seconds: float = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+    ) -> None:
+        if type(max_requests) is not int or max_requests < 1:
+            raise ValueError("max_requests deve ser inteiro positivo")
+        if not isinstance(window_seconds, (int, float)) or isinstance(window_seconds, bool) or not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError("window_seconds deve ser número finito positivo")
+        self.max_requests = max_requests
+        self.window_seconds = float(window_seconds)
+        self._lock = threading.Lock()
+        self._buckets: dict[str, deque[float]] = {}
+
+    def allow(self, key: str = "default") -> tuple[bool, int, float]:
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                if len(self._buckets) >= 1024:
+                    stale_keys = [k for k, q in self._buckets.items() if not q or q[-1] <= cutoff]
+                    for stale in stale_keys:
+                        self._buckets.pop(stale, None)
+                    if len(self._buckets) >= 1024:
+                        return False, 0, self.window_seconds
+                bucket = deque()
+                self._buckets[key] = bucket
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if len(bucket) >= self.max_requests:
+                retry_after = max(0.0, self.window_seconds - (now - bucket[0]))
+                return False, 0, retry_after
+            bucket.append(now)
+            return True, max(0, self.max_requests - len(bucket)), 0.0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._buckets.clear()
 
 STUDIO_HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -291,17 +342,83 @@ def _allowed_host(host: str) -> bool:
     return port_s is None or 1 <= int(port_s) <= 65535
 
 
-def create_studio_server(workspace: "DossieWorkspace", host: str = "127.0.0.1", port: int = 8090) -> ThreadingHTTPServer:
+def create_studio_server(
+    workspace: "DossieWorkspace",
+    host: str = "127.0.0.1",
+    port: int = 8090,
+    *,
+    rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
+    rate_limit_window_seconds: float = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+) -> ThreadingHTTPServer:
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("Por segurança, o Dossier Studio vincula exclusivamente em interface de loopback local.")
 
     csrf_token = secrets.token_hex(24)
     lock = threading.RLock()
+    rate_limiter = RateLimiter(
+        max_requests=rate_limit_requests,
+        window_seconds=rate_limit_window_seconds,
+    )
 
     class StudioHandler(BaseHTTPRequestHandler):
+        def _init_request_tracking(self) -> None:
+            self._body_consumed = False
+
+        def _drain_unconsumed_body(self) -> None:
+            """Drena corpos pequenos/moderados antes de fechar em erro >= 400 (evita TCP RST no Windows)."""
+            if getattr(self, "_body_consumed", False):
+                return
+            self._body_consumed = True
+            if self.command in ("GET", "HEAD"):
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError):
+                return
+            if length <= 0 or length > _MAX_DRAIN_BYTES:
+                return
+            prev_timeout = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(0.5)
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, _DRAIN_CHUNK_BYTES))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                pass
+            finally:
+                try:
+                    self.connection.settimeout(prev_timeout)
+                except OSError:
+                    pass
+
         def _verify_host(self) -> bool:
             if not _allowed_host(self.headers.get("Host", "")):
                 self._send_json({"status": "denied", "reason": "Host HTTP não autorizado"}, code=403)
+                return False
+            return True
+
+        def _check_rate_limit(self) -> bool:
+            client_key = self.client_address[0] if self.client_address else "local"
+            allowed, _, retry_after = rate_limiter.allow(client_key)
+            if not allowed:
+                retry_seconds = max(1, math.ceil(retry_after))
+                self._send_json(
+                    {
+                        "status": "rate_limited",
+                        "error": "rate_limit_exceeded",
+                        "retry_after_seconds": retry_seconds,
+                        "reason": "Limite temporário de requisições excedido; aguarde antes de tentar novamente.",
+                    },
+                    code=429,
+                    extra_headers={
+                        "Retry-After": str(retry_seconds),
+                        "X-RateLimit-Limit": str(rate_limiter.max_requests),
+                        "X-RateLimit-Remaining": "0",
+                    },
+                )
                 return False
             return True
 
@@ -323,17 +440,25 @@ def create_studio_server(workspace: "DossieWorkspace", host: str = "127.0.0.1", 
             return True
 
         def _read_body(self) -> dict | None:
+            if self.headers.get("Transfer-Encoding"):
+                self._body_consumed = True
+                self._send_json({"status": "invalid", "reason": "Transfer-Encoding não suportado"}, code=411)
+                return None
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except (TypeError, ValueError):
+                self._body_consumed = True
                 self._send_json({"status": "invalid", "reason": "Content-Length inválido"}, code=400)
                 return None
             if length < 0:
+                self._body_consumed = True
                 self._send_json({"status": "invalid", "reason": "Content-Length negativo"}, code=400)
                 return None
             if length > MAX_BODY_BYTES:
+                self._drain_unconsumed_body()
                 self._send_json({"status": "invalid", "reason": "Corpo excede 64 KB"}, code=413)
                 return None
+            self._body_consumed = True
             if length == 0:
                 return {}
             try:
@@ -347,19 +472,25 @@ def create_studio_server(workspace: "DossieWorkspace", host: str = "127.0.0.1", 
             return obj
 
         def do_GET(self):
-            if not self._verify_host():
+            self._init_request_tracking()
+            if not self._verify_host() or not self._check_rate_limit():
                 return
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path in ("/", "/index.html"):
                 body = STUDIO_HTML.replace("__STUDIO_CSRF_TOKEN__", csrf_token).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("X-Frame-Options", "DENY")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'")
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
             elif parsed.path == "/api/scenarios":
                 self._send_json({"status": "ok", "scenarios": list(SCENARIO_CATALOG.values())})
             elif parsed.path == "/api/snapshot":
@@ -369,7 +500,8 @@ def create_studio_server(workspace: "DossieWorkspace", host: str = "127.0.0.1", 
                 self._send_json({"status": "not_found", "reason": "Rota inexistente"}, code=404)
 
         def do_POST(self):
-            if not self._verify_host() or not self._verify_csrf():
+            self._init_request_tracking()
+            if not self._verify_host() or not self._check_rate_limit() or not self._verify_csrf():
                 return
             data = self._read_body()
             if data is None:
@@ -414,25 +546,35 @@ def create_studio_server(workspace: "DossieWorkspace", host: str = "127.0.0.1", 
             except (Invalid, Conflict, Uncertain, Locked, ValueError, KeyError) as exc:
                 self._send_json({"status": "rejected", "error_type": type(exc).__name__, "reason": str(exc)}, code=422)
 
-        def _send_json(self, payload: dict, code: int = 200):
-            raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        def _send_json(self, payload: dict, code: int = 200, *, extra_headers: dict[str, str] | None = None):
             if code >= 400:
+                self._drain_unconsumed_body()
                 self.close_connection = True
+            raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Cache-Control", "no-store")
+            if extra_headers:
+                for header_name, header_val in extra_headers.items():
+                    self.send_header(header_name, header_val)
+            if code >= 400:
+                self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(raw)
-            self.wfile.flush()
+            try:
+                self.wfile.write(raw)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
 
         def log_message(self, format, *args):
             return
 
     server = ThreadingHTTPServer((host, port), StudioHandler)
     server.csrf_token = csrf_token  # type: ignore[attr-defined]
+    server.rate_limiter = rate_limiter  # type: ignore[attr-defined]
     return server
 
 

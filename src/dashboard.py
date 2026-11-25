@@ -4,11 +4,15 @@ Dashboard Web Local para o Epistemic Memory Core
 Interface interativa de visualização, busca e operação do sistema.
 Utiliza apenas a biblioteca padrão do Python (sem dependências externas).
 """
+from collections import deque
 import json
+import math
 import os
 import re
 import secrets
 import sys
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,10 +23,52 @@ sys.path.insert(0, str(ROOT))
 import ponte_pessoal as p
 
 MAX_POST_BYTES = 65536
+DEFAULT_RATE_LIMIT_REQUESTS = 300
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60.0
 _MAX_DRAIN_BYTES = 262144
 _DRAIN_CHUNK_BYTES = 16384
 SESSION_TOKEN = secrets.token_hex(24)
 _ALLOWED_HOST_RE = re.compile(r'^(?:127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$', re.I)
+
+
+class RateLimiter:
+    """Limitador de taxa em janela deslizante thread-safe usando apenas stdlib."""
+
+    def __init__(self, max_requests=DEFAULT_RATE_LIMIT_REQUESTS, window_seconds=DEFAULT_RATE_LIMIT_WINDOW_SECONDS):
+        if type(max_requests) is not int or max_requests < 1:
+            raise ValueError('max_requests deve ser inteiro positivo')
+        if not isinstance(window_seconds, (int, float)) or isinstance(window_seconds, bool) or not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError('window_seconds deve ser número finito positivo')
+        self.max_requests = max_requests
+        self.window_seconds = float(window_seconds)
+        self._lock = threading.Lock()
+        self._buckets = {}
+
+    def allow(self, key='default'):
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                if len(self._buckets) >= 1024:
+                    stale_keys = [k for k, q in self._buckets.items() if not q or q[-1] <= cutoff]
+                    for stale in stale_keys:
+                        self._buckets.pop(stale, None)
+                    if len(self._buckets) >= 1024:
+                        return False, 0, self.window_seconds
+                bucket = deque()
+                self._buckets[key] = bucket
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if len(bucket) >= self.max_requests:
+                retry_after = max(0.0, self.window_seconds - (now - bucket[0]))
+                return False, 0, retry_after
+            bucket.append(now)
+            return True, max(0, self.max_requests - len(bucket)), 0.0
+
+    def reset(self):
+        with self._lock:
+            self._buckets.clear()
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -549,9 +595,43 @@ def _is_allowed_host(host_header):
 
 class DashboardHandler(BaseHTTPRequestHandler):
     csrf_token = SESSION_TOKEN
+    _server_limiter_lock = threading.Lock()
 
     def _init_request_tracking(self):
         self._body_consumed = False
+
+    def _get_rate_limiter(self):
+        limiter = getattr(self.server, 'rate_limiter', None)
+        if limiter is None:
+            with self._server_limiter_lock:
+                limiter = getattr(self.server, 'rate_limiter', None)
+                if limiter is None:
+                    limiter = RateLimiter()
+                    self.server.rate_limiter = limiter
+        return limiter
+
+    def _check_rate_limit(self):
+        limiter = self._get_rate_limiter()
+        client_key = self.client_address[0] if self.client_address else 'local'
+        allowed, _, retry_after = limiter.allow(client_key)
+        if not allowed:
+            retry_seconds = max(1, math.ceil(retry_after))
+            self.send_json(
+                {
+                    'status': 'rate_limited',
+                    'error': 'rate_limit_exceeded',
+                    'retry_after_seconds': retry_seconds,
+                    'reason': 'Limite temporário de requisições excedido; aguarde antes de tentar novamente.',
+                },
+                code=429,
+                extra_headers={
+                    'Retry-After': str(retry_seconds),
+                    'X-RateLimit-Limit': str(limiter.max_requests),
+                    'X-RateLimit-Remaining': '0',
+                },
+            )
+            return False
+        return True
 
     def _drain_unconsumed_body(self):
         """Drena corpos pequenos/moderados antes de fechar em erro >= 400 (evita TCP RST no Windows)."""
@@ -641,7 +721,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._init_request_tracking()
-        if not self._check_host():
+        if not self._check_host() or not self._check_rate_limit():
             return
         url = urllib.parse.urlparse(self.path)
         if url.path in ('/', '/index.html'):
@@ -676,7 +756,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._init_request_tracking()
-        if not self._check_host() or not self._check_csrf():
+        if not self._check_host() or not self._check_rate_limit() or not self._check_csrf():
             return
         data = self._read_json_body()
         if data is None:
@@ -695,7 +775,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_json({'status': 'not_found', 'reason': 'Endpoint não encontrado'}, code=404)
 
-    def send_json(self, data, code=200):
+    def send_json(self, data, code=200, extra_headers=None):
         if code >= 400:
             self._drain_unconsumed_body()
             self.close_connection = True
@@ -706,6 +786,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Cache-Control', 'no-store')
+        if extra_headers:
+            for header_name, header_val in extra_headers.items():
+                self.send_header(header_name, header_val)
         if code >= 400:
             self.send_header('Connection', 'close')
         self.end_headers()
@@ -719,12 +802,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # Silencia logs de polling do dashboard no terminal
         return
 
-def run_dashboard(port=8080, max_tries=20):
+def run_dashboard(port=8080, max_tries=20, rate_limit_requests=DEFAULT_RATE_LIMIT_REQUESTS, rate_limit_window_seconds=DEFAULT_RATE_LIMIT_WINDOW_SECONDS):
+    limiter = RateLimiter(max_requests=rate_limit_requests, window_seconds=rate_limit_window_seconds)
     last_error = None
     for candidate_port in range(port, min(65536, port + max(1, max_tries))):
         server_address = ('127.0.0.1', candidate_port)
         try:
             httpd = ThreadingHTTPServer(server_address, DashboardHandler)
+            httpd.rate_limiter = limiter
         except OSError as exc:
             last_error = exc
             continue

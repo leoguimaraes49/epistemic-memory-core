@@ -12,16 +12,19 @@ JSON sobre HTTP local (`127.0.0.1`), preservando integralmente:
 """
 from __future__ import annotations
 
+from collections import deque
 import copy
 import difflib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
 import sqlite3
 import sys
 import threading
+import time
 import urllib.parse
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,8 +41,54 @@ if SRC_DIR.is_dir() and str(SRC_DIR) not in sys.path:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8095
 MAX_BODY_BYTES = 65536
+DEFAULT_RATE_LIMIT_REQUESTS = 300
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60.0
 _MAX_DRAIN_BYTES = 262144
 _DRAIN_CHUNK_BYTES = 16384
+
+
+class RateLimiter:
+    """Limitador de taxa em janela deslizante thread-safe usando apenas stdlib."""
+
+    def __init__(
+        self,
+        max_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
+        window_seconds: float = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+    ) -> None:
+        if type(max_requests) is not int or max_requests < 1:
+            raise ValueError("max_requests deve ser inteiro positivo")
+        if not isinstance(window_seconds, (int, float)) or isinstance(window_seconds, bool) or not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError("window_seconds deve ser número finito positivo")
+        self.max_requests = max_requests
+        self.window_seconds = float(window_seconds)
+        self._lock = threading.Lock()
+        self._buckets: dict[str, deque[float]] = {}
+
+    def allow(self, key: str = "default") -> tuple[bool, int, float]:
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                if len(self._buckets) >= 1024:
+                    stale_keys = [k for k, q in self._buckets.items() if not q or q[-1] <= cutoff]
+                    for stale in stale_keys:
+                        self._buckets.pop(stale, None)
+                    if len(self._buckets) >= 1024:
+                        return False, 0, self.window_seconds
+                bucket = deque()
+                self._buckets[key] = bucket
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
+            if len(bucket) >= self.max_requests:
+                retry_after = max(0.0, self.window_seconds - (now - bucket[0]))
+                return False, 0, retry_after
+            bucket.append(now)
+            return True, max(0, self.max_requests - len(bucket)), 0.0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._buckets.clear()
 
 _ALLOWED_HOST_RE = re.compile(r"^(?:127\.0\.0\.1|localhost|\[::1\])(?::([1-9]\d{0,4}))?$", re.I)
 
@@ -1985,6 +2034,8 @@ def create_gateway_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     api_token: str | None = None,
+    rate_limit_requests: int = DEFAULT_RATE_LIMIT_REQUESTS,
+    rate_limit_window_seconds: float = DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
 ) -> ThreadingHTTPServer:
     """Cria `ThreadingHTTPServer` endurecido vinculado estritamente a interface de loopback."""
     if host not in ("127.0.0.1", "localhost", "::1"):
@@ -1994,12 +2045,38 @@ def create_gateway_server(
     ui_session_token = secrets.token_hex(24)
     while _constant_time_token_eq(ui_session_token, resolved_api_token):
         ui_session_token = secrets.token_hex(24)
+    rate_limiter = RateLimiter(
+        max_requests=rate_limit_requests,
+        window_seconds=rate_limit_window_seconds,
+    )
 
     class GatewayRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def _init_request_tracking(self) -> None:
             self._body_consumed = False
+
+        def _check_rate_limit(self) -> bool:
+            client_key = self.client_address[0] if self.client_address else "local"
+            allowed, _, retry_after = rate_limiter.allow(client_key)
+            if not allowed:
+                retry_seconds = max(1, math.ceil(retry_after))
+                self._send_json(
+                    {
+                        "status": "rate_limited",
+                        "error": "rate_limit_exceeded",
+                        "retry_after_seconds": retry_seconds,
+                        "reason": "Limite temporário de requisições excedido; aguarde antes de tentar novamente.",
+                    },
+                    code=429,
+                    extra_headers={
+                        "Retry-After": str(retry_seconds),
+                        "X-RateLimit-Limit": str(rate_limiter.max_requests),
+                        "X-RateLimit-Remaining": "0",
+                    },
+                )
+                return False
+            return True
 
         def _drain_small_unread_body(self) -> None:
             """Drena corpos pequenos/moderados antes de fechar em erro >= 400 (evita TCP RST em Windows/macOS BSD)."""
@@ -2199,7 +2276,7 @@ def create_gateway_server(
 
         def do_GET(self) -> None:
             self._init_request_tracking()
-            if not self._verify_host():
+            if not self._verify_host() or not self._check_rate_limit():
                 return
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
@@ -2294,7 +2371,7 @@ def create_gateway_server(
 
         def do_POST(self) -> None:
             self._init_request_tracking()
-            if not self._verify_host():
+            if not self._verify_host() or not self._check_rate_limit():
                 return
             auth_scope = self._authenticate_bearer()
             if auth_scope is None:
@@ -2377,7 +2454,13 @@ def create_gateway_server(
                     code=422,
                 )
 
-        def _send_json(self, payload: dict[str, Any], code: int = 200) -> None:
+        def _send_json(
+            self,
+            payload: dict[str, Any],
+            code: int = 200,
+            *,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             if code >= 400:
                 self._drain_small_unread_body()
                 self.close_connection = True
@@ -2389,6 +2472,9 @@ def create_gateway_server(
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+            if extra_headers:
+                for header_name, header_val in extra_headers.items():
+                    self.send_header(header_name, header_val)
             if code == 401:
                 self.send_header("WWW-Authenticate", 'Bearer realm="epistemic-http-gateway"')
             if code >= 400:
@@ -2408,4 +2494,5 @@ def create_gateway_server(
     server.api_token = resolved_api_token  # type: ignore[attr-defined]
     server.ui_token = ui_session_token  # type: ignore[attr-defined]
     server.runtime = runtime  # type: ignore[attr-defined]
+    server.rate_limiter = rate_limiter  # type: ignore[attr-defined]
     return server

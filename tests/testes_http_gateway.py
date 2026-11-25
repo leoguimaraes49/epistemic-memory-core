@@ -1277,6 +1277,80 @@ class HttpGatewayEndToEndTests(unittest.TestCase):
                 else:
                     os.environ["EMC_AUTHORIZED_ROOTS"] = saved_auth_roots
 
+    def test_rate_limiting_enforces_429_retry_after_and_window_reset(self) -> None:
+        import time
+
+        limited_token = "gw-rate-limit-token"
+        limited_srv = create_gateway_server(
+            self.runtime,
+            host="127.0.0.1",
+            port=0,
+            api_token=limited_token,
+            rate_limit_requests=3,
+            rate_limit_window_seconds=0.25,
+        )
+        limited_port = limited_srv.server_address[1]
+        limited_thread = threading.Thread(target=limited_srv.serve_forever, daemon=True)
+        limited_thread.start()
+        try:
+            def call_health():
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{limited_port}/api/v1/health",
+                    headers={"Authorization": f"Bearer {limited_token}"},
+                    method="GET",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        return resp.status, dict(resp.headers), resp.read().decode("utf-8")
+                except urllib.error.HTTPError as err:
+                    return err.code, dict(err.headers), err.read().decode("utf-8")
+
+            for _ in range(3):
+                code, _, _ = call_health()
+                self.assertEqual(code, 200)
+
+            code_429, hdrs_429, raw_429 = call_health()
+            self.assertEqual(code_429, 429)
+            self.assertGreaterEqual(int(hdrs_429.get("Retry-After", "0")), 1)
+            self.assertEqual(hdrs_429.get("X-RateLimit-Limit"), "3")
+            self.assertEqual(hdrs_429.get("X-RateLimit-Remaining"), "0")
+            body_429 = json.loads(raw_429)
+            self.assertEqual(body_429["status"], "rate_limited")
+            self.assertEqual(body_429["error"], "rate_limit_exceeded")
+
+            # POST com corpo JSON sob 429 deve drenar o corpo e retornar JSON limpo + Retry-After
+            post_req = urllib.request.Request(
+                f"http://127.0.0.1:{limited_port}/api/v1/search",
+                data=json.dumps({"query": "rate-limit-check", "padding": "x" * 4096}).encode("utf-8"),
+                headers={"Authorization": f"Bearer {limited_token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as post_ctx:
+                urllib.request.urlopen(post_req, timeout=10)
+            self.assertEqual(post_ctx.exception.code, 429)
+            self.assertGreaterEqual(int(post_ctx.exception.headers.get("Retry-After", "0")), 1)
+            self.assertEqual(json.loads(post_ctx.exception.read().decode("utf-8"))["error"], "rate_limit_exceeded")
+
+            time.sleep(0.3)
+            code_after, _, _ = call_health()
+            self.assertEqual(code_after, 200)
+
+            # Limite máximo de 1024 chaves ativas (fail-closed contra exaustão de memória)
+            from apps.http_gateway.server import RateLimiter as GatewayRateLimiter
+
+            cap_limiter = GatewayRateLimiter(max_requests=1, window_seconds=60.0)
+            for idx in range(1024):
+                ok_key, _, _ = cap_limiter.allow(f"client-{idx}")
+                self.assertTrue(ok_key)
+            ok_overflow, rem_overflow, retry_overflow = cap_limiter.allow("client-overflow")
+            self.assertFalse(ok_overflow)
+            self.assertEqual(rem_overflow, 0)
+            self.assertGreater(retry_overflow, 0.0)
+        finally:
+            limited_srv.shutdown()
+            limited_srv.server_close()
+            limited_thread.join(timeout=3)
+
 
 if __name__ == "__main__":
     unittest.main()
