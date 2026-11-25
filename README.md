@@ -5,6 +5,7 @@
 🇺🇸 [Read in English](README.en.md) · [Epistemic Dossier Studio](apps/dossie_studio/README.md) · [Agent Memory SDK](apps/agent_memory_sdk/README.md) · [HTTP Gateway](apps/http_gateway/README.md) · [Manual Normativo (17 Capítulos)](00_Manual/indice-manual-cerebro.md) · [Arquitetura Detalhada](docs/guias/ARQUITETURA.md)
 
 [![CI](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml/badge.svg)](https://github.com/leoguimaraes49/epistemic-memory-core/actions/workflows/testes.yml)
+[![M8ven Score](https://m8ven.ai/badge/mcp/leoguimaraes49-epistemic-memory-core-19kbfa?v=61b230699d7b3e147b2f0bc30c189d6e)](https://m8ven.ai/mcp/leoguimaraes49-epistemic-memory-core-19kbfa?s=readme)
 [![Python 3.11 | 3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![MCP 1.26](https://img.shields.io/badge/protocol-MCP%201.26%20%7C%20SDK%20%7C%20REST-purple.svg)](https://modelcontextprotocol.io/)
 [![ONNX Local](https://img.shields.io/badge/embeddings-E5--multilingual%20(ONNX%20Local)-green.svg)](https://github.com/microsoft/onnxruntime)

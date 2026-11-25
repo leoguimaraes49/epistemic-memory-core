@@ -2,6 +2,7 @@
 import os, json, hashlib, stat, threading, sqlite3
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from nucleo import Store,Conflict,Uncertain,Locked,Invalid,REAL_VAULT,REAL_SYSTEM,config_file
 from conhecimento import Knowledge
 from autoteste import gate,run_tests
@@ -34,7 +35,11 @@ def error(e):
     if isinstance(e,Locked): return {'status':'locked','reason':str(e)}
     return {'status':'invalid','reason':str(e)}
 
-@server.tool()
+# Considere inclusive a inicialização local, o histórico de busca e os efeitos
+# das tarefas que uma ferramenta pode disparar no executor.
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def estado() -> dict:
     """Estado e limitações da ponte pessoal; não expõe conteúdo."""
     from execucao import config
@@ -62,7 +67,9 @@ def _is_redirected(path: Path) -> bool:
         return False
 
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def ler_manual(nome: str) -> dict:
     """Lê somente o índice ou um capítulo do manual integral, sem dados pessoais."""
     if (not isinstance(nome,str) or not nome or '\x00' in nome or '/' in nome or '\\' in nome
@@ -125,7 +132,9 @@ def ler_manual(nome: str) -> dict:
     if hashlib.sha256(conteudo).hexdigest()!=manifesto[nome]:return {'status':'invalid','reason':'Manual alterado; revisão do manifesto necessária'}
     return {'status':'ok','content':conteudo.decode('utf-8-sig')}
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def avaliar_resposta(operation_key: str, resposta: dict, contexto_ids: list[str] | None = None,
                      limite_contexto: int = 8) -> dict:
     """Confere alegações e conflitos de atribuição a pessoas. Use antes de descrever perfil/biografia; texto livre continua provisório."""
@@ -137,7 +146,9 @@ def avaliar_resposta(operation_key: str, resposta: dict, contexto_ids: list[str]
     except (Conflict,Uncertain,Locked,Invalid,OSError,ValueError,TypeError,KeyError) as e:return error(e)
 
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def consultar_comprovante(receipt_id: str) -> dict:
     """Reconfere um comprovante na geração atual antes de informar sua validade."""
     if not authorized():return blocked()
@@ -147,21 +158,27 @@ def consultar_comprovante(receipt_id: str) -> dict:
     except (Conflict,Uncertain,Locked,Invalid,OSError,ValueError,TypeError,KeyError) as e:return error(e)
 
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def listar_fontes() -> dict:
     """Lista somente fontes pessoais autorizadas; rótulos são conteúdo protegido."""
     if not authorized():return blocked()
     try:return {'status':'ok','records':store.list()}
     except (Conflict,Locked,Invalid,OSError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def ler_fonte(record_id: str) -> dict:
     """Lê fonte atual após verificação de integridade e acesso."""
     if not authorized():return blocked()
     try:return {'status':'ok','record':store.read(record_id)}
     except (Conflict,Locked,Invalid,OSError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def registrar_fonte(operation_key: str,titulo: str,conteudo: str) -> dict:
     """Registra relato fornecido pelo usuário; não invente conteúdo nem diagnóstico."""
     if not authorized():return blocked()
@@ -170,7 +187,9 @@ def registrar_fonte(operation_key: str,titulo: str,conteudo: str) -> dict:
         return store.apply(operation_key,'create',title=titulo,text=conteudo)
     except (Conflict,Uncertain,Locked,Invalid,OSError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+))
 def retificar_fonte(operation_key: str,record_id: str,revisao_esperada: int,conteudo: str,motivo: str) -> dict:
     """Retifica fonte com chave e revisão; preservar autoria e reler bases dependentes."""
     if not authorized():return blocked()
@@ -179,20 +198,26 @@ def retificar_fonte(operation_key: str,record_id: str,revisao_esperada: int,cont
         return store.apply(operation_key,'correct',ident=record_id,expected=revisao_esperada,text=conteudo,reason=motivo)
     except (Conflict,Uncertain,Locked,Invalid,OSError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+))
 def excluir_fonte(operation_key: str,record_id: str,revisao_esperada: int) -> dict:
     """Exclui fonte controlada e histórico local apenas por solicitação expressa; não garante apagamento de cópias externas."""
     if not authorized():return blocked()
     try:return store.delete(operation_key,record_id,revisao_esperada)
     except (Conflict,Uncertain,Locked,Invalid,OSError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def consultar_operacao(operation_key: str) -> dict:
     """Verifica confirmação ou pendência antes de repetir uma operação."""
     if not authorized():return blocked()
     return store.status(operation_key)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+))
 def registrar_conhecimento(operation_key: str,tipo: str,titulo: str,payload: dict,record_id: str | None=None,revisao_esperada: int | None=None) -> dict:
     """Grava conhecimento e avaliações tipados com referências versionadas. Recebe propostas explícitas; não transforma hipótese em diagnóstico."""
     if not authorized():return blocked()
@@ -201,14 +226,18 @@ def registrar_conhecimento(operation_key: str,tipo: str,titulo: str,payload: dic
         return Knowledge(store).apply(operation_key,tipo,titulo,payload,record_id,revisao_esperada)
     except (Conflict,Uncertain,Locked,Invalid,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def ler_conhecimento(record_id: str) -> dict:
     """Lê conhecimento e sinaliza bases corrigidas/excluídas, inclusive dependências indiretas."""
     if not authorized():return blocked()
     try:return {'status':'ok',**Knowledge(store).read(record_id)}
     except (Conflict,Uncertain,Locked,Invalid,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
+))
 def buscar_contexto(consulta: str,limite: int=12,profundidade: int=1) -> dict:
     """Busca textual, vetorial local e por referências conforme a configuração; não garante suficiência."""
     if not authorized():return blocked()
@@ -223,20 +252,26 @@ def buscar_contexto(consulta: str,limite: int=12,profundidade: int=1) -> dict:
         return result
     except (Conflict,Uncertain,Locked,Invalid,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def verificar_fluxo() -> dict:
     """Verifica referências e vigência na consulta; não declara todo o manual implementado."""
     if not authorized():return blocked()
     try:return Knowledge(store).audit()
     except (Conflict,Uncertain,Locked,Invalid,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
+))
 def executar_autotestes() -> dict:
     """Executa testes de código em dados fictícios e registra resultado local. Não modifica fontes pessoais."""
     if not authorized():return blocked()
     return run_tests(force=True)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True,
+))
 def processar_contribuicao(operation_key: str,titulo: str,texto_original: str,extracoes: list[dict]) -> dict:
     """Registra texto original e extrações explícitas da IA. Referências $fonte e $0, $1 ligam o conjunto. Retorna efeitos parciais sem esconder falhas."""
     if not authorized():return blocked()
@@ -260,7 +295,9 @@ def processar_contribuicao(operation_key: str,titulo: str,texto_original: str,ex
         return result
     except (Conflict,Uncertain,Locked,Invalid,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def estado_executor() -> dict:
     """Estado da fila e do trabalhador local. Não inicia nem habilita serviço."""
     if not authorized():return blocked()
@@ -273,7 +310,9 @@ def estado_executor() -> dict:
         return {'status':'ok',**status}
     except (Invalid,Conflict,OSError,ValueError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+))
 def enfileirar_manutencao(operation_key: str,tipo: str) -> dict:
     """Agenda somente auditoria do cofre, atualização da visão ou autotestes na fila já habilitada."""
     if not authorized():return blocked()
@@ -284,7 +323,9 @@ def enfileirar_manutencao(operation_key: str,tipo: str) -> dict:
         return {'status':execution['execution_status'],'execution':execution}
     except (Invalid,Conflict,OSError,ValueError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def consultar_execucao(execution_id: str) -> dict:
     """Consulta estado, tentativas, limites e efeitos confirmados da execução."""
     if not authorized():return blocked()
@@ -292,7 +333,9 @@ def consultar_execucao(execution_id: str) -> dict:
     try:return {'status':'ok','execution':Queue(store).get(execution_id)}
     except (Invalid,Conflict,OSError,ValueError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+))
 def cancelar_execucao(execution_id: str) -> dict:
     """Cancela novas etapas do trabalho; não apaga dados nem reverte efeitos já confirmados."""
     if not authorized():return blocked()
@@ -300,7 +343,9 @@ def cancelar_execucao(execution_id: str) -> dict:
     try:return {'status':'ok','execution':Queue(store).cancel(execution_id)}
     except (Invalid,Conflict,OSError,ValueError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def preparar_decisao(operation_key: str,titulo: str,situacao: str,opcoes: list[dict],fontes: list[dict],lacunas: list[str]) -> dict:
     """Registra análise provisória com origem das opções e lacunas. Não escolhe, não estima sucesso e não executa ações externas."""
     if not authorized():return blocked()
@@ -311,7 +356,9 @@ def preparar_decisao(operation_key: str,titulo: str,situacao: str,opcoes: list[d
     except (Conflict,Uncertain,Locked,Invalid,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def estado_execucao() -> dict:
     """Capacidades da execução integrada e modelo configurado; não comprova disponibilidade permanente."""
     if not authorized():return blocked()
@@ -322,7 +369,9 @@ def estado_execucao() -> dict:
             'limits':{'max_actions':cfg['max_actions'],'max_model_calls':cfg['max_model_calls'],'max_seconds':cfg['max_seconds']},
             'scope':'Primeiro cofre; pesquisa bibliográfica, revalidação provisória, avaliações e ajustes delimitados.'}
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
+))
 def iniciar_demanda(operation_key: str,tipo: str,entrada: dict,executar_agora: bool=False) -> dict:
     """Planeja uma contribuição, pergunta, correção, pesquisa, resultado ou melhoria. Por padrão usa a fila durável."""
     if not authorized():return blocked()
@@ -336,7 +385,9 @@ def iniciar_demanda(operation_key: str,tipo: str,entrada: dict,executar_agora: b
         return {'status':job['execution_status'],'execution_id':ident,'job_id':job['id']}
     except (Invalid,Conflict,Uncertain,Locked,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def consultar_demanda(execution_id: str) -> dict:
     """Consulta etapas, efeitos, espera e limitações de uma demanda; não reexecuta o trabalho."""
     if not authorized():return blocked()
@@ -347,7 +398,9 @@ def consultar_demanda(execution_id: str) -> dict:
         return {'status':'ok',**snapshot}
     except (Invalid,Conflict,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True,
+))
 def responder_pendencia(execution_id: str,resposta: str,executar_agora: bool=False) -> dict:
     """Registra resposta com origem e retoma a parte pendente; receber resposta não garante resolver a questão."""
     if not authorized():return blocked()
@@ -363,7 +416,9 @@ def responder_pendencia(execution_id: str,resposta: str,executar_agora: bool=Fal
         return result
     except (Invalid,Conflict,Uncertain,Locked,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
+))
 def cancelar_demanda(execution_id: str) -> dict:
     """Interrompe novas etapas e solicita parada do trabalho associado; mantém efeitos confirmados ou incertos."""
     if not authorized():return blocked()
@@ -378,7 +433,9 @@ def cancelar_demanda(execution_id: str) -> dict:
         return {'status':status,'execution_id':execution_id,'rollback_performed':False}
     except (Invalid,Conflict,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def registrar_documento(operation_key: str,titulo: str,conteudo: str,metadados: dict) -> dict:
     """Registra fonte documental com natureza, disponibilidade e localizador próprios; não é relato pessoal."""
     if not authorized():return blocked()
@@ -387,7 +444,9 @@ def registrar_documento(operation_key: str,titulo: str,conteudo: str,metadados: 
         return store.apply(operation_key,'create',title=titulo,text=conteudo,source_metadata=metadados)
     except (Invalid,Conflict,Uncertain,Locked,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
+))
 def concluir_avaliacao(operation_key: str,assessment_id: str) -> dict:
     """Conclui aplicação e calcula somente quando a regra registrada e as respostas permitem; não produz diagnóstico."""
     if not authorized():return blocked()
@@ -397,7 +456,9 @@ def concluir_avaliacao(operation_key: str,assessment_id: str) -> dict:
         return finish(store,operation_key,assessment_id)
     except (Invalid,Conflict,Uncertain,Locked,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
+))
 def pontuar_avaliacao(operation_key: str,assessment_id: str) -> dict:
     """Calcula resultado reproduzível de aplicação elegível; resposta ausente não vira zero."""
     if not authorized():return blocked()
@@ -407,7 +468,9 @@ def pontuar_avaliacao(operation_key: str,assessment_id: str) -> dict:
         return score(store,operation_key,assessment_id)
     except (Invalid,Conflict,Uncertain,Locked,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+))
 def adotar_melhoria(operation_key: str,candidate_id: str) -> dict:
     """Adota somente ajuste previamente delimitado, avaliado e permitido pela configuração local."""
     if not authorized():return blocked()
@@ -417,7 +480,9 @@ def adotar_melhoria(operation_key: str,candidate_id: str) -> dict:
         return adopt(store,operation_key,candidate_id)
     except (Invalid,Conflict,Uncertain,Locked,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+))
 def reverter_melhoria(operation_key: str) -> dict:
     """Restaura configuração anterior de adoção registrada, detectando mudança concorrente."""
     if not authorized():return blocked()
@@ -458,7 +523,9 @@ def liberar_recuperacao(job_id: str) -> dict:
     except (Invalid,Conflict,OSError,ValueError,sqlite3.Error) as e:return error(e)
 
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+))
 def listar_demandas(limite: int=20) -> dict:
     """Recupera o ponto de continuidade e as pendências atuais; não reinicia tarefas ou preenche o perfil."""
     if not authorized():return blocked()
@@ -483,7 +550,9 @@ def listar_demandas(limite: int=20) -> dict:
     except (Invalid,Conflict,OSError,ValueError,KeyError,TypeError) as e:return error(e)
 
 
-@server.tool()
+@server.tool(annotations=ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+))
 def registrar_revisao(operation_key: str,record_id: str,revisao_esperada: int,review_status: str,fonte: dict,trecho: str,alcance: str) -> dict:
     """Registra o que o usuário confirmou/contestou, ligado à fala e à versão; não confirma cálculo ou diagnóstico."""
     if not authorized():return blocked()

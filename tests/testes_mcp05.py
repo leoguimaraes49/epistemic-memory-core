@@ -43,8 +43,26 @@ async def check():
         async with stdio_client(params) as streams:
             async with ClientSession(*streams) as session:
                 await session.initialize()
-                tools = {t.name for t in (await session.list_tools()).tools}
-                assert {'avaliar_resposta', 'consultar_comprovante'} <= tools
+                tools = {t.name: t for t in (await session.list_tools()).tools}
+                assert len(tools) == 33
+                assert 'liberar_recuperacao' not in tools
+                hint_fields = ('readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint')
+                hints = {}
+                for name, tool in tools.items():
+                    annotations = tool.annotations
+                    assert annotations is not None, name
+                    hints[name] = tuple(getattr(annotations, field) for field in hint_fields)
+                    assert all(type(value) is bool for value in hints[name]), (name, hints[name])
+                assert hints['ler_manual'] == (True, False, True, False)
+                assert hints['consultar_comprovante'] == (False, False, True, False)
+                assert hints['avaliar_resposta'] == (False, False, True, False)
+                assert hints['buscar_contexto'] == (False, True, False, False)
+                assert hints['registrar_fonte'] == (False, False, True, False)
+                assert hints['excluir_fonte'] == (False, True, True, False)
+                assert hints['iniciar_demanda'] == (False, True, False, True)
+                assert {name for name, values in hints.items() if values[-1]} == {
+                    'processar_contribuicao', 'iniciar_demanda', 'responder_pendencia',
+                }
                 state = decoded(await session.call_tool('estado', {}))
                 assert state['version'] == '0.5' and state['vault'] == str(sources.vault)
                 first = decoded(await session.call_tool('registrar_fonte', {'operation_key': 'first',
